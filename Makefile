@@ -4,7 +4,7 @@
 
 CC = gcc
 CFLAGS = -Wall -O2 -I include
-LDFLAGS = -L . -lfftw3f
+LDFLAGS = -L . -lfftw3f -lm
 
 # Source directories
 SRC_DIR = src
@@ -12,16 +12,19 @@ INC_DIR = include
 
 # Source files
 SRCS = $(SRC_DIR)/readwav.c \
+       $(SRC_DIR)/read_pcm.c \
        $(SRC_DIR)/dealay_and_sum.c \
        $(SRC_DIR)/fft_path.c \
        $(SRC_DIR)/gcc_phat_delay.c \
        $(SRC_DIR)/file_utils.c \
-       $(SRC_DIR)/split_stereo.c \
-       $(SRC_DIR)/merge_audio.c \
-       $(SRC_DIR)/check_wav.c
+       $(SRC_DIR)/merge_audio.c
 
-# Object files
+# Object files (no main() - safe to link with any target)
 OBJS = $(SRCS:.c=.o)
+
+# Separate objects that have their own main()
+SPLIT_STEREO_OBJS = $(SRC_DIR)/split_stereo.o $(SRC_DIR)/file_utils.o $(SRC_DIR)/readwav.o
+CHECK_WAV_OBJS = $(SRC_DIR)/check_wav.o $(SRC_DIR)/readwav.o
 
 # Target executables
 TARGETS = beamforming.exe \
@@ -42,11 +45,11 @@ fft_beamforming_fixed.exe: $(SRC_DIR)/fft_beamforming_fixed.o $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Stereo splitting tool
-split_stereo.exe: $(SRC_DIR)/split_stereo.o $(SRC_DIR)/file_utils.o $(SRC_DIR)/readwav.o
+split_stereo.exe: $(SPLIT_STEREO_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # WAV file checker
-check_wav.exe: $(SRC_DIR)/check_wav.o $(SRC_DIR)/readwav.o
+check_wav.exe: $(CHECK_WAV_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # PCM delay estimator (for raw 16-bit mono PCM files)
@@ -62,7 +65,7 @@ $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 
 # Clean all generated files
 clean:
-	del /Q *.exe *.o $(SRC_DIR)\*.o
+	rm -f *.exe *.o $(SRC_DIR)/*.o
 
 # Rebuild everything
 rebuild: clean all
