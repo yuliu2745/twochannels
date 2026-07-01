@@ -14,6 +14,7 @@ INC_DIR = include
 SRCS = $(SRC_DIR)/readwav.c \
        $(SRC_DIR)/dealay_and_sum.c \
        $(SRC_DIR)/fft_path.c \
+       $(SRC_DIR)/gcc_phat_delay.c \
        $(SRC_DIR)/file_utils.c \
        $(SRC_DIR)/split_stereo.c \
        $(SRC_DIR)/merge_audio.c \
@@ -26,7 +27,8 @@ OBJS = $(SRCS:.c=.o)
 TARGETS = beamforming.exe \
           fft_beamforming_fixed.exe \
           split_stereo.exe \
-          check_wav.exe
+          check_wav.exe \
+          delay_estimate_pcm.exe
 
 # Default target
 all: $(TARGETS)
@@ -46,6 +48,10 @@ split_stereo.exe: $(SRC_DIR)/split_stereo.o $(SRC_DIR)/file_utils.o $(SRC_DIR)/r
 # WAV file checker
 check_wav.exe: $(SRC_DIR)/check_wav.o $(SRC_DIR)/readwav.o
 	$(CC) $(CFLAGS) -o $@ $^
+
+# PCM delay estimator (for raw 16-bit mono PCM files)
+delay_estimate_pcm.exe: $(SRC_DIR)/delay_estimate_pcm.o $(SRC_DIR)/read_pcm.o $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Object file compilation rules
 main.o: main.c

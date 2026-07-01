@@ -15,6 +15,7 @@
 - 立体声 WAV 文件分离为左右单声道
 - WAV 文件格式检测与信息查看
 - 按 TDOA（到达时间差）原理模拟双麦克风阵列的立体声测试信号
+- **直接读取裸 PCM 文件（16-bit 单声道小端），无需 WAV 头（新增）**
 
 ---
 
@@ -32,6 +33,7 @@ twochannels/
 ├── fft_beamforming_fixed.exe       # FFT-PHAT 专用可执行文件
 ├── split_stereo.exe                # 立体声分离可执行文件
 ├── check_wav.exe                   # WAV 检查可执行文件
+├── delay_estimate_pcm.exe          # 裸 PCM 延迟估计工具（新增）
 │
 ├── libfftw3f-3.dll                 # FFTW 单精度浮点动态库
 │
@@ -42,7 +44,8 @@ twochannels/
 │   ├── fft_path.h                  # FFT-PHAT 频域延迟估计接口
 │   ├── file_utils.h                # 文件路径工具接口
 │   ├── split_stereo.h              # 立体声分离接口
-│   └── merge_audio.h               # 音频合并/重采样/TDOA 生成接口
+│   ├── merge_audio.h               # 音频合并/重采样/TDOA 生成接口
+│   └── read_pcm.h                  # 裸 PCM 文件读写接口（新增）
 │
 ├── src/                            # 源文件目录
 │   ├── readwav.c                   # WAV 文件读取与写入实现
@@ -52,7 +55,9 @@ twochannels/
 │   ├── file_utils.c                # 文件路径处理实现
 │   ├── split_stereo.c              # 立体声分离实现（含 main）
 │   ├── check_wav.c                 # WAV 文件检测实现
-│   └── merge_audio.c               # 重采样、延迟应用、TDOA 生成实现
+│   ├── merge_audio.c               # 重采样、延迟应用、TDOA 生成实现
+│   ├── read_pcm.c                  # 裸 PCM 文件读写实现（新增）
+│   └── delay_estimate_pcm.c        # 裸 PCM 延迟估计工具（新增）
 │
 ├── audio_files/                    # 测试音频文件
 │   ├── music_16kHz.wav             # 交响乐（16kHz，约 8 秒）
@@ -163,6 +168,15 @@ delay_samples = τ * sample_rate
 - 输出采样率、声道数、位深度、时长等信息
 - 显示前 10 个样本值
 
+### 5. `delay_estimate_pcm.exe` — 裸 PCM 延迟估计工具（新增）
+
+- **源文件**：[delay_estimate_pcm.c](src/delay_estimate_pcm.c)
+- **命令行**：`delay_estimate_pcm.exe pcm_file1 pcm_file2 sample_rate [output.wav]`
+- 直接读取 **16-bit 单声道小端** 裸 PCM 文件（无 WAV 头）
+- 需要用户指定采样率（Hz）
+- 支持时域互相关和 FFT-PHAT 两种算法（交互式选择）
+- 可选第 4 个参数，生成对齐后的 WAV 输出文件
+
 ---
 
 ## API 函数
@@ -182,6 +196,8 @@ delay_samples = τ * sample_rate
 | `int calculate_tdoa_delay(mic_distance, sound_speed, angle, sample_rate)` | [merge_audio.c](src/merge_audio.c#L64-L75) | 计算 TDOA 延迟样本数 |
 | `int16_t* merge_signals(signal1, signal2, length)` | [merge_audio.c](src/merge_audio.c#L78-L93) | 合并两个音频信号（防溢出） |
 | `int generate_stereo_with_tdoa(voiceFile, sineFile, outputFile, mic_distance, sound_speed, angle_voice, angle_noise)` | [merge_audio.c](src/merge_audio.c#L96-L332) | 生成含 TDOA 的立体声测试信号 |
+| `int16_t* read_pcm(filename, &numSamples)` | [read_pcm.c](src/read_pcm.c#L13-L68) | 读取裸 PCM 文件（16-bit mono 小端） |
+| `int write_pcm(filename, data, numSamples)` | [read_pcm.c](src/read_pcm.c#L74-L89) | 写入裸 PCM 文件 |
 
 ---
 
@@ -251,6 +267,19 @@ fft_beamforming_fixed.exe audio_files\input1.wav audio_files\input2.wav fft_outp
 **方案 C — 手动指定延迟**
 ```bash
 beamforming.exe input1.wav input2.wav output.wav delay1_samples delay2_samples
+```
+
+**方案 D — 裸 PCM 文件延迟估计（新增，无需 WAV 头）**
+```bash
+# 直接计算两个 16-bit 单声道裸 PCM 文件间的延迟
+# sample_rate 必须指定（如 16000、44100、48000）
+delay_estimate_pcm.exe mic1.pcm mic2.pcm 16000
+
+# 使用 FFT-PHAT（通过管道传入选择）
+echo 2 | delay_estimate_pcm.exe mic1.pcm mic2.pcm 48000
+
+# 同时输出对齐后的 WAV 文件
+delay_estimate_pcm.exe mic1_normal.pcm mic2_normal.pcm 16000 aligned_output.wav
 ```
 
 #### 步骤 3：处理立体声文件
