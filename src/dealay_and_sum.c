@@ -127,7 +127,7 @@ int estimate_delay_interactive(const int16_t* data1, uint32_t len1,
         for (uint32_t i = 0; i < len2; i++) f2[i] = (float)data2[i] / 32768.0f;
 
         int fft_size = 1024;
-        int max_delay = 50;
+        int max_delay = 10;
         int sig_len = (int)min_len;
 
         if (sig_len < fft_size) {
