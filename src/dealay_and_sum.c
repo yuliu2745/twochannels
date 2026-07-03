@@ -113,7 +113,7 @@ int estimate_delay_interactive(const int16_t* data1, uint32_t len1,
     uint32_t min_len = (len1 < len2) ? len1 : len2;
 
     if (choice == 3) {
-        /* ---------- GCC-PHAT ---------- */
+        /* ---------- GCC-PHAT (context-based) ---------- */
         printf("Using GCC-PHAT delay estimation...\n");
 
         float* f1 = (float*)malloc(len1 * sizeof(float));
@@ -139,8 +139,18 @@ int estimate_delay_interactive(const int16_t* data1, uint32_t len1,
             max_delay = sig_len / 4;
 
         printf("  Parameters: fft_size=%d, max_delay=%d\n", fft_size, max_delay);
-        estimated_delay = compute_gcc_phat_delay(f1, f2, sig_len, max_delay, fft_size);
-        printf("GCC-PHAT estimated delay: %d samples\n", estimated_delay);
+
+        GccPhatContext gctx;
+        if (gcc_phat_init(&gctx, fft_size) != 0) {
+            fprintf(stderr, "GCC-PHAT init failed\n");
+            free(f1); free(f2);
+            return 0;
+        }
+        float gcc_delay = gcc_phat_compute(&gctx, f1, f2, sig_len, max_delay);
+        gcc_phat_destroy(&gctx);
+
+        estimated_delay = (int)gcc_delay;
+        printf("GCC-PHAT estimated delay: %.4f samples\n", gcc_delay);
 
         free(f1); free(f2);
 
