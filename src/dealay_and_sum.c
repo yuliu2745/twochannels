@@ -44,19 +44,19 @@ int estimate_delay(const int16_t* x, uint32_t len_x,
 
 
 
-// 延迟求和,两个信号，各自延迟delay1和delay2样本，求和并平均
-int16_t* delay_sum(const int16_t* data1, uint32_t len1, int delay1,
-                   const int16_t* data2, uint32_t len2, int delay2,
-                   uint32_t* outLen) 
+// 延迟求和，两个信号各自延迟 delay1 和 delay2 样本（支持子样点精度），求和并平均
+int16_t* delay_sum(const int16_t* data1, uint32_t len1, float delay1,
+                   const int16_t* data2, uint32_t len2, float delay2,
+                   uint32_t* outLen)
 {
     // 找到最小延迟，将所有延迟调整为非负
-    int minDelay = (delay1 < delay2) ? delay1 : delay2;
-    int adjDelay1 = delay1 - minDelay;
-    int adjDelay2 = delay2 - minDelay;
+    float minDelay = (delay1 < delay2) ? delay1 : delay2;
+    float adjDelay1 = delay1 - minDelay;
+    float adjDelay2 = delay2 - minDelay;
 
-    // 输出长度 = max(len1 + adjDelay1, len2 + adjDelay2)
-    uint32_t outLen1 = len1 + adjDelay1;
-    uint32_t outLen2 = len2 + adjDelay2;
+    // 输出长度 = max(ceil(adjDelay) + len, ...)
+    uint32_t outLen1 = len1 + (uint32_t)ceilf(adjDelay1);
+    uint32_t outLen2 = len2 + (uint32_t)ceilf(adjDelay2);
     *outLen = (outLen1 > outLen2) ? outLen1 : outLen2;
 
     int16_t* outData = (int16_t*)calloc(*outLen, sizeof(int16_t));
@@ -65,20 +65,32 @@ int16_t* delay_sum(const int16_t* data1, uint32_t len1, int delay1,
         return NULL;
     }
 
-    // 求和
-    for (uint32_t i = 0; i < *outLen; i++) 
+    // 求和（线性插值处理子样点延迟）
+    for (uint32_t i = 0; i < *outLen; i++)
     {
-        int32_t sum = 0;
+        float sum = 0.0f;
+
         // 通道1
-        if (i >= adjDelay1 && i - adjDelay1 < len1) {
-            sum += data1[i - adjDelay1];
+        float pos1 = (float)i - adjDelay1;
+        if (pos1 >= 0.0f && pos1 < (float)len1 - 1.0f) {
+            int idx = (int)pos1;
+            float frac = pos1 - (float)idx;
+            sum += (1.0f - frac) * (float)data1[idx] + frac * (float)data1[idx + 1];
+        } else if (pos1 >= 0.0f && pos1 < (float)len1) {
+            sum += (float)data1[(int)pos1];
         }
+
         // 通道2
-        if (i >= adjDelay2 && i - adjDelay2 < len2) {
-            sum += data2[i - adjDelay2];
+        float pos2 = (float)i - adjDelay2;
+        if (pos2 >= 0.0f && pos2 < (float)len2 - 1.0f) {
+            int idx = (int)pos2;
+            float frac = pos2 - (float)idx;
+            sum += (1.0f - frac) * (float)data2[idx] + frac * (float)data2[idx + 1];
+        } else if (pos2 >= 0.0f && pos2 < (float)len2) {
+            sum += (float)data2[(int)pos2];
         }
-        // 平均并转换为int16_t
-        int16_t val = (int16_t)(sum / 2);
+
+        int16_t val = (int16_t)(sum / 2.0f);
         outData[i] = val;
     }
 
@@ -91,9 +103,9 @@ int16_t* delay_sum(const int16_t* data1, uint32_t len1, int delay1,
  * 显示算法选择菜单，调用用户指定的方法估算两路信号间延迟。
  * 将 int16_t 转换为 float 的逻辑封装在函数内部，main 无需关心。
  */
-int estimate_delay_interactive(const int16_t* data1, uint32_t len1,
-                                const int16_t* data2, uint32_t len2,
-                                int sample_rate)
+float estimate_delay_interactive(const int16_t* data1, uint32_t len1,
+                                 const int16_t* data2, uint32_t len2,
+                                 int sample_rate)
 {
     printf("Choosing delay estimation method:\n");
     printf("  1. Time-domain cross-correlation\n");
@@ -109,7 +121,7 @@ int estimate_delay_interactive(const int16_t* data1, uint32_t len1,
     int c;
     while ((c = getchar()) != '\n' && c != EOF);
 
-    int estimated_delay = 0;
+    float estimated_delay = 0.0f;
     uint32_t min_len = (len1 < len2) ? len1 : len2;
 
     if (choice == 3) {
@@ -121,7 +133,7 @@ int estimate_delay_interactive(const int16_t* data1, uint32_t len1,
         if (!f1 || !f2) {
             fprintf(stderr, "Memory allocation failed\n");
             free(f1); free(f2);
-            return 0;
+            return 0.0f;
         }
         for (uint32_t i = 0; i < len1; i++) f1[i] = (float)data1[i] / 32768.0f;
         for (uint32_t i = 0; i < len2; i++) f2[i] = (float)data2[i] / 32768.0f;
@@ -144,13 +156,12 @@ int estimate_delay_interactive(const int16_t* data1, uint32_t len1,
         if (gcc_phat_init(&gctx, fft_size) != 0) {
             fprintf(stderr, "GCC-PHAT init failed\n");
             free(f1); free(f2);
-            return 0;
+            return 0.0f;
         }
-        float gcc_delay = gcc_phat_compute(&gctx, f1, f2, sig_len, max_delay);
+        estimated_delay = gcc_phat_compute(&gctx, f1, f2, sig_len, max_delay);
         gcc_phat_destroy(&gctx);
 
-        estimated_delay = (int)gcc_delay;
-        printf("GCC-PHAT estimated delay: %.4f samples\n", gcc_delay);
+        printf("GCC-PHAT estimated delay: %.4f samples\n", estimated_delay);
 
         free(f1); free(f2);
 
@@ -184,8 +195,8 @@ int estimate_delay_interactive(const int16_t* data1, uint32_t len1,
                           f2, f1, margin, window, fft_size);
 
         if (peak_num > 0) {
-            estimated_delay = delays[0];
-            printf("FFT-PHAT estimated delay: %d samples (confidence: %.6f)\n",
+            estimated_delay = (float)delays[0];
+            printf("FFT-PHAT estimated delay: %.4f samples (confidence: %.6f)\n",
                    estimated_delay, peak_values[0]);
         } else {
             printf("FFT-PHAT failed, falling back to time-domain method\n");
@@ -201,10 +212,10 @@ int estimate_delay_interactive(const int16_t* data1, uint32_t len1,
         if ((int)len1 - 1 < max_delay) max_delay = (int)len1 - 1;
         if ((int)len2 - 1 < max_delay) max_delay = (int)len2 - 1;
         if (max_delay < 0) max_delay = 0;
-        estimated_delay = estimate_delay(data1, len1, data2, len2, max_delay);
-        printf("Time-domain estimated delay: %d samples\n", estimated_delay);
+        estimated_delay = (float)estimate_delay(data1, len1, data2, len2, max_delay);
+        printf("Time-domain estimated delay: %.4f samples\n", estimated_delay);
     }
 
-    printf("Estimated relative delay: %d samples (positive = second signal lags)\n", estimated_delay);
+    printf("Estimated relative delay: %.4f samples (positive = second signal lags)\n", estimated_delay);
     return estimated_delay;
 }

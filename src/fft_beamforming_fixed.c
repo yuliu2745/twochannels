@@ -131,7 +131,7 @@ int do_work_fft(int argc, char* argv[]) {
         // 延迟求和
         printf("Performing delay-and-sum...\n");
         uint32_t outLen;
-        int16_t* outData = delay_sum(data1, len1, delay1, data2, len2, delay2, &outLen);
+        int16_t* outData = delay_sum(data1, len1, (float)delay1, data2, len2, (float)delay2, &outLen);
         if (!outData) {
             fprintf(stderr, "Error in delay_sum operation\n");
             free(data1);

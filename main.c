@@ -54,7 +54,7 @@ int do_work(int argc, char* argv[])
     int manual_expected = is_wav ? 6 : 7;
     int sample_rate = 0;
     int manual_delay = 0;
-    int delay1 = 0, delay2 = 0;
+    float delay1 = 0.0f, delay2 = 0.0f;
 
     if (argc != expected && argc != manual_expected) {
         fprintf(stderr, "ERROR: wrong number of arguments.\n");
@@ -78,10 +78,10 @@ int do_work(int argc, char* argv[])
 
     if (argc == manual_expected) {
         int sr_offset = is_wav ? 0 : 1;
-        delay1 = atoi(argv[4 + sr_offset]);
-        delay2 = atoi(argv[5 + sr_offset]);
+        delay1 = (float)atof(argv[4 + sr_offset]);
+        delay2 = (float)atof(argv[5 + sr_offset]);
         manual_delay = 1;
-        printf("Using manual delay: delay1=%d, delay2=%d\n", delay1, delay2);
+        printf("Using manual delay: delay1=%.4f, delay2=%.4f\n", delay1, delay2);
     }
 
     /* ---- 加载音频 ---- */
@@ -107,17 +107,17 @@ int do_work(int argc, char* argv[])
     /* ---- 延迟估计 ---- */
     if (!manual_delay) {
         printf("Auto-calculating delay...\n");
-        int est = estimate_delay_interactive(a1->data, a1->num_samples,
+        float est = estimate_delay_interactive(a1->data, a1->num_samples,
                                               a2->data, a2->num_samples,
                                               (int)a1->sample_rate);
-        if (est >= 0) {
-            delay1 = 0;
+        if (est >= 0.0f) {
+            delay1 = 0.0f;
             delay2 = est;
         } else {
             delay1 = -est;
-            delay2 = 0;
+            delay2 = 0.0f;
         }
-        printf("Applied delay: delay1=%d, delay2=%d\n", delay1, delay2);
+        printf("Applied delay: delay1=%.4f, delay2=%.4f\n", delay1, delay2);
     }
 
     /* ---- 波束成形 ---- */

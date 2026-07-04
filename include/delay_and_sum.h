@@ -3,7 +3,9 @@
 
 #include "setting.h"
 
-int16_t* delay_sum(const int16_t* data1, uint32_t len1, int delay1, const int16_t* data2, uint32_t len2, int delay2, uint32_t* outLen);
+int16_t* delay_sum(const int16_t* data1, uint32_t len1, float delay1,
+                   const int16_t* data2, uint32_t len2, float delay2,
+                   uint32_t* outLen);
 int estimate_delay(const int16_t* x, uint32_t len_x, const int16_t* y, uint32_t len_y, int max_delay);
 
 /**
@@ -14,9 +16,10 @@ int estimate_delay(const int16_t* x, uint32_t len_x, const int16_t* y, uint32_t 
  * @param len2        信号2 长度
  * @param sample_rate 采样率（仅用于参数提示）
  * @return 估计的延迟（样点数），正=信号2滞后，负=信号2超前，0=失败
+ *         子样点精度（GCC-PHAT 返回浮点结果）
  */
-int estimate_delay_interactive(const int16_t* data1, uint32_t len1,
-                                const int16_t* data2, uint32_t len2,
-                                int sample_rate);
+float estimate_delay_interactive(const int16_t* data1, uint32_t len1,
+                                 const int16_t* data2, uint32_t len2,
+                                 int sample_rate);
 
 #endif

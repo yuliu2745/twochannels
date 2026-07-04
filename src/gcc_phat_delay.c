@@ -90,23 +90,32 @@ float gcc_phat_compute(GccPhatContext *ctx,
     int input_len = ctx->input_len;
     int window_len = (len < fft_size) ? len : fft_size;
 
+    /*DC去除，避免0延迟假峰*/
+    double sum1 = 0.0, sum2 = 0.0;
+    for (int i = 0; i < window_len; i++) {
+            sum1 += (double)sig1[i];
+        sum2 += (double)sig2[i];
+    }
+    double mean1 = sum1 / window_len;
+    double mean2 = sum2 / window_len;
+
     /* ---------- 加窗 + 零填充 ---------- */
     for (int i = 0; i < window_len; i++) {
         float w = ctx->window_coeffs[i];
-        ctx->in1[i] = sig1[i] * w;
-        ctx->in2[i] = sig2[i] * w;
+        ctx->in1[i] = (sig1[i] - (float)mean1) * w;
+        ctx->in2[i] = (sig2[i] - (float)mean2) * w;
     }
     for (int i = window_len; i < input_len; i++) {
         ctx->in1[i] = 0.0f;
         ctx->in2[i] = 0.0f;
     }
 
-    /* ---------- 前向 FFT ---------- */
+    /* ---------- FFT ---------- */
     fftwf_execute(ctx->plan_fwd1);
     fftwf_execute(ctx->plan_fwd2);
 
     /* ---------- GCC-PHAT 核心 ---------- */
-    int nbins = fft_size / 2 + 1;
+    int nbins = ctx->complex_len;
     for (int i = 0; i < nbins; i++) {
         float re_x = ctx->out1[i][0];
         float im_x = ctx->out1[i][1];
