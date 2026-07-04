@@ -97,124 +97,156 @@ int16_t* delay_sum(const int16_t* data1, uint32_t len1, float delay1,
     return outData;
 }
 
+/* ========== 三个延迟估计函数（各自独立封装） ========== */
+
 /**
- * @brief 交互式延迟估计
+ * @brief 方法1：时域互相关延迟估计
+ */
+static float estimate_delay_time_domain(const int16_t* data1, uint32_t len1,
+                                         const int16_t* data2, uint32_t len2)
+{
+    int max_delay = 5000;
+    if ((int)len1 - 1 < max_delay) max_delay = (int)len1 - 1;
+    if ((int)len2 - 1 < max_delay) max_delay = (int)len2 - 1;
+    if (max_delay < 0) max_delay = 0;
+    float delay = (float)estimate_delay(data1, len1, data2, len2, max_delay);
+    printf("Time-domain estimated delay: %.4f samples\n", delay);
+    return delay;
+}
+
+/**
+ * @brief 方法2：FFT-PHAT (legacy) 延迟估计
+ */
+static float estimate_delay_fft_phat(const int16_t* data1, uint32_t len1,
+                                      const int16_t* data2, uint32_t len2)
+{
+    uint32_t min_len = (len1 < len2) ? len1 : len2;
+
+    float* f1 = (float*)malloc(len1 * sizeof(float));
+    float* f2 = (float*)malloc(len2 * sizeof(float));
+    if (!f1 || !f2) {
+        fprintf(stderr, "Memory allocation failed\n");
+        free(f1); free(f2);
+        return 0.0f;
+    }
+    for (uint32_t i = 0; i < len1; i++) f1[i] = (float)data1[i] / 32768.0f;
+    for (uint32_t i = 0; i < len2; i++) f2[i] = (float)data2[i] / 32768.0f;
+
+    int fft_size = 512;
+    int window = (min_len < (uint32_t)fft_size) ? min_len : (uint32_t)fft_size;
+    int margin = 200;
+    int peak_num = 1;
+    int* delays = (int*)malloc(sizeof(int));
+    float* peak_values = (float*)malloc(sizeof(float));
+    if (!delays || !peak_values) {
+        fprintf(stderr, "Memory allocation failed\n");
+        free(f1); free(f2); free(delays); free(peak_values);
+        return 0.0f;
+    }
+
+    FFT_Real_Gcc_Path(delays, peak_values, &peak_num,
+                      f2, f1, margin, window, fft_size);
+
+    float estimated_delay = 0.0f;
+    if (peak_num > 0) {
+        estimated_delay = (float)delays[0];
+        printf("FFT-PHAT estimated delay: %.4f samples (confidence: %.6f)\n",
+               estimated_delay, peak_values[0]);
+    } else {
+        printf("FFT-PHAT failed, falling back to time-domain method\n");
+        estimated_delay = estimate_delay(data1, len1, data2, len2, 5000);
+    }
+
+    free(f1); free(f2); free(delays); free(peak_values);
+    return estimated_delay;
+}
+
+/**
+ * @brief 方法3：GCC-PHAT (context-based) 延迟估计
+ */
+static float estimate_delay_gcc_phat(const int16_t* data1, uint32_t len1,
+                                      const int16_t* data2, uint32_t len2,
+                                      int sample_rate)
+{
+    (void)sample_rate; /* 保留参数以备将来可能使用 */
+
+    uint32_t min_len = (len1 < len2) ? len1 : len2;
+
+    float* f1 = (float*)malloc(len1 * sizeof(float));
+    float* f2 = (float*)malloc(len2 * sizeof(float));
+    if (!f1 || !f2) {
+        fprintf(stderr, "Memory allocation failed\n");
+        free(f1); free(f2);
+        return 0.0f;
+    }
+    for (uint32_t i = 0; i < len1; i++) f1[i] = (float)data1[i] / 32768.0f;
+    for (uint32_t i = 0; i < len2; i++) f2[i] = (float)data2[i] / 32768.0f;
+
+    int fft_size = 1024;
+    int max_delay = 10;
+    int sig_len = (int)min_len;
+
+    if (sig_len < fft_size) {
+        fft_size = 1;
+        while (fft_size * 2 <= sig_len) fft_size *= 2;
+        printf("  Adjusting fft_size to %d (signal too short)\n", fft_size);
+    }
+    if (max_delay >= sig_len)
+        max_delay = sig_len / 4;
+
+    printf("  Parameters: fft_size=%d, max_delay=%d\n", fft_size, max_delay);
+
+    GccPhatContext gctx;
+    if (gcc_phat_init(&gctx, fft_size) != 0) {
+        fprintf(stderr, "GCC-PHAT init failed\n");
+        free(f1); free(f2);
+        return 0.0f;
+    }
+    float estimated_delay = gcc_phat_compute(&gctx, f1, f2, sig_len, max_delay);
+    gcc_phat_destroy(&gctx);
+
+    printf("GCC-PHAT estimated delay: %.4f samples\n", estimated_delay);
+
+    free(f1); free(f2);
+    return estimated_delay;
+}
+
+/**
+ * @brief 延迟估计入口
  *
- * 显示算法选择菜单，调用用户指定的方法估算两路信号间延迟。
- * 将 int16_t 转换为 float 的逻辑封装在函数内部，main 无需关心。
+ * 调用具体方法估算两路信号间延迟。
+ * 将 int16_t 转换为 float 的逻辑封装在各方法内部，main 无需关心。
+ *
+ * == 三种方法接口 ==
+ *
+ *   // 1. 时域互相关
+ *   // float delay = estimate_delay_time_domain(data1, len1, data2, len2);
+ *
+ *   // 2. FFT-PHAT (legacy)
+ *   // float delay = estimate_delay_fft_phat(data1, len1, data2, len2);
+ *
+ *   // 3. GCC-PHAT (当前使用)
+ *   // float delay = estimate_delay_gcc_phat(data1, len1, data2, len2, sample_rate);
+ *
+ * 
  */
 float estimate_delay_interactive(const int16_t* data1, uint32_t len1,
                                  const int16_t* data2, uint32_t len2,
                                  int sample_rate)
 {
-    printf("Choosing delay estimation method:\n");
-    printf("  1. Time-domain cross-correlation\n");
-    printf("  2. FFT-PHAT (legacy implementation)\n");
-    printf("  3. GCC-PHAT (phase transform, robust)\n");
-    printf("Enter choice (1, 2 or 3): ");
+    /* 当前使用 ---- GCC-PHAT ----------------------------------- */
+    float estimated_delay = estimate_delay_gcc_phat(data1, len1, data2, len2, sample_rate);
+    /* ---------------------------------------------------------- */
 
-    int choice;
-    if (scanf("%d", &choice) != 1) {
-        choice = 1;
-    }
-    /* 清空输入缓冲区 */
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF);
+    /*
+    // 备选1：时域互相关
+    float estimated_delay = estimate_delay_time_domain(data1, len1, data2, len2);
+    */
 
-    float estimated_delay = 0.0f;
-    uint32_t min_len = (len1 < len2) ? len1 : len2;
-
-    if (choice == 3) {
-        /* ---------- GCC-PHAT (context-based) ---------- */
-        printf("Using GCC-PHAT delay estimation...\n");
-
-        float* f1 = (float*)malloc(len1 * sizeof(float));
-        float* f2 = (float*)malloc(len2 * sizeof(float));
-        if (!f1 || !f2) {
-            fprintf(stderr, "Memory allocation failed\n");
-            free(f1); free(f2);
-            return 0.0f;
-        }
-        for (uint32_t i = 0; i < len1; i++) f1[i] = (float)data1[i] / 32768.0f;
-        for (uint32_t i = 0; i < len2; i++) f2[i] = (float)data2[i] / 32768.0f;
-
-        int fft_size = 1024;
-        int max_delay = 10;
-        int sig_len = (int)min_len;
-
-        if (sig_len < fft_size) {
-            fft_size = 1;
-            while (fft_size * 2 <= sig_len) fft_size *= 2;
-            printf("  Adjusting fft_size to %d (signal too short)\n", fft_size);
-        }
-        if (max_delay >= sig_len)
-            max_delay = sig_len / 4;
-
-        printf("  Parameters: fft_size=%d, max_delay=%d\n", fft_size, max_delay);
-
-        GccPhatContext gctx;
-        if (gcc_phat_init(&gctx, fft_size) != 0) {
-            fprintf(stderr, "GCC-PHAT init failed\n");
-            free(f1); free(f2);
-            return 0.0f;
-        }
-        estimated_delay = gcc_phat_compute(&gctx, f1, f2, sig_len, max_delay);
-        gcc_phat_destroy(&gctx);
-
-        printf("GCC-PHAT estimated delay: %.4f samples\n", estimated_delay);
-
-        free(f1); free(f2);
-
-    } else if (choice == 2) {
-        /* ---------- FFT-PHAT (legacy) ---------- */
-        printf("Using FFT-PHAT delay estimation...\n");
-
-        float* f1 = (float*)malloc(len1 * sizeof(float));
-        float* f2 = (float*)malloc(len2 * sizeof(float));
-        if (!f1 || !f2) {
-            fprintf(stderr, "Memory allocation failed\n");
-            free(f1); free(f2);
-            return 0;
-        }
-        for (uint32_t i = 0; i < len1; i++) f1[i] = (float)data1[i] / 32768.0f;
-        for (uint32_t i = 0; i < len2; i++) f2[i] = (float)data2[i] / 32768.0f;
-
-        int fft_size = 512;
-        int window = (min_len < (uint32_t)fft_size) ? min_len : (uint32_t)fft_size;
-        int margin = 200;
-        int peak_num = 1;
-        int* delays = (int*)malloc(sizeof(int));
-        float* peak_values = (float*)malloc(sizeof(float));
-        if (!delays || !peak_values) {
-            fprintf(stderr, "Memory allocation failed\n");
-            free(f1); free(f2); free(delays); free(peak_values);
-            return 0;
-        }
-
-        FFT_Real_Gcc_Path(delays, peak_values, &peak_num,
-                          f2, f1, margin, window, fft_size);
-
-        if (peak_num > 0) {
-            estimated_delay = (float)delays[0];
-            printf("FFT-PHAT estimated delay: %.4f samples (confidence: %.6f)\n",
-                   estimated_delay, peak_values[0]);
-        } else {
-            printf("FFT-PHAT failed, falling back to time-domain method\n");
-            estimated_delay = estimate_delay(data1, len1, data2, len2, 5000);
-        }
-
-        free(f1); free(f2); free(delays); free(peak_values);
-
-    } else {
-        /* ---------- Time-domain ---------- */
-        printf("Using time-domain delay estimation...\n");
-        int max_delay = 5000;
-        if ((int)len1 - 1 < max_delay) max_delay = (int)len1 - 1;
-        if ((int)len2 - 1 < max_delay) max_delay = (int)len2 - 1;
-        if (max_delay < 0) max_delay = 0;
-        estimated_delay = (float)estimate_delay(data1, len1, data2, len2, max_delay);
-        printf("Time-domain estimated delay: %.4f samples\n", estimated_delay);
-    }
+    /*
+    // 备选2：FFT-PHAT (legacy)
+    float estimated_delay = estimate_delay_fft_phat(data1, len1, data2, len2);
+    */
 
     printf("Estimated relative delay: %.4f samples (positive = second signal lags)\n", estimated_delay);
     return estimated_delay;
