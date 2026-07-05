@@ -81,7 +81,8 @@ fail:
 
 float gcc_phat_compute(GccPhatContext *ctx,
                        const float *sig1, const float *sig2,
-                       int len, int max_delay)
+                       int len, int max_delay,
+                       int sample_rate)
 {
     if (!ctx || !sig1 || !sig2 || len < 2 || max_delay < 1)
         return 0.0f;
@@ -137,6 +138,20 @@ float gcc_phat_compute(GccPhatContext *ctx,
         }
     }
 
+    // ====================== 层1：300~3400Hz 带通掩码（优化时延估计精度） ======================
+    // 使用调用方传入的 sample_rate，而非硬编码值
+    float bin_hz = (float)sample_rate / (float)ctx->input_len; // input_len = 2*fft_size，R2C频点分辨率
+    int bin_low  = (int)ceilf(300.0f / bin_hz);
+    int bin_high = (int)floorf(3400.0f / bin_hz);
+    for(int k = 0; k < nbins; k++)
+    {
+        if(k < bin_low || k > bin_high)
+        {
+            ctx->cs[k][0] = 0.0f;
+            ctx->cs[k][1] = 0.0f;
+        }
+    }
+    
     /* ---------- 逆 FFT ---------- */
     fftwf_execute(ctx->plan_inv);
 

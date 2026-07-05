@@ -18,7 +18,6 @@ int estimate_delay(const int16_t* x, uint32_t len_x,
 
     // 时域互相关：对于每个可能的延迟 k，计算 x[0..N-1] 与 y[k..k+N-1] 的点积
     // 为了简单，只使用两个信号重叠部分的最大长度
-    int N = (len_x < len_y) ? len_x : len_y;
     // 实际使用重叠长度取决于延迟，但为了效率，我们取固定长度，忽略边界效应
     // 更精确的做法是对于每个 k，取有效重叠部分
     // 这里简化：使用所有重叠样本（动态计算）
@@ -97,6 +96,126 @@ int16_t* delay_sum(const int16_t* data1, uint32_t len1, float delay1,
     return outData;
 }
 
+/**
+ * @brief 频域延迟补偿+波束成形（帧循环+重叠相加）
+ *
+ * 对输入全长音频做分帧处理：
+ *   每帧 Hamming 加窗 → FFT → 相位旋转(补偿浮点延迟)
+ *   → DSB 频域相加 → 300~3400Hz 带通掩码 → IFFT
+ *   → 重叠相加合成完整时域输出
+ */
+int16_t* freq_domain_beamform(GccPhatContext* ctx,
+                              const int16_t* data1, uint32_t len1,
+                              const int16_t* data2, uint32_t len2,
+                              float delay, int fs, uint32_t* outLen)
+{
+    int fft_size  = ctx->fft_size;      // 1024
+    int input_len = ctx->input_len;     // 2048 = 2*fft_size
+    int nbins     = ctx->complex_len;   // fft_size + 1
+    int hop       = fft_size / 2;       // 50% 重叠
+
+    // 人声带通边界
+    float bin_hz = (float)fs / (float)input_len;
+    int bin_low  = (int)ceilf(300.0f / bin_hz);
+    int bin_high = (int)floorf(3400.0f / bin_hz);
+
+    uint32_t min_len = (len1 < len2) ? len1 : len2;
+    if (min_len == 0) { *outLen = 0; return NULL; }
+
+    // 帧数计算
+    int nframes = (min_len + hop - 1) / hop;
+    if (nframes < 1) nframes = 1;
+    uint32_t total_out = (nframes - 1) * hop + fft_size;
+
+    // 浮点累加缓冲 + 归一化权重累加
+    float* out_float = (float*)calloc(total_out, sizeof(float));
+    float* out_norm  = (float*)calloc(total_out, sizeof(float));
+    if (!out_float || !out_norm) {
+        free(out_float); free(out_norm);
+        *outLen = 0; return NULL;
+    }
+
+    for (int f = 0; f < nframes; f++)
+    {
+        int start = f * hop;
+        int remain = (int)min_len - start;
+        int frame_len = (remain < fft_size) ? remain : fft_size;
+        if (frame_len <= 0) break;
+
+        // 清空输入缓冲
+        memset(ctx->in1, 0, input_len * sizeof(float));
+        memset(ctx->in2, 0, input_len * sizeof(float));
+
+        // Hamming 加窗
+        for (int i = 0; i < frame_len; i++) {
+            float w = ctx->window_coeffs[i];
+            ctx->in1[i] = (float)data1[start + i] * w;
+            ctx->in2[i] = (float)data2[start + i] * w;
+        }
+
+        // FFT
+        fftwf_execute(ctx->plan_fwd1);
+        fftwf_execute(ctx->plan_fwd2);
+
+        // 相位旋转补偿亚采样延迟（复制 mic2 频谱用于旋转）
+        fftwf_complex mic2_align[nbins];
+        memcpy(mic2_align, ctx->out2, sizeof(fftwf_complex) * nbins);
+        for (int k = 0; k < nbins; k++) {
+            float omega = 2.0f * (float)M_PI * k / (float)input_len;
+            float phase = omega * delay;
+            float c = cosf(phase), s = sinf(phase);
+            float yr = mic2_align[k][0], yi = mic2_align[k][1];
+            mic2_align[k][0] = yr * c + yi * s;
+            mic2_align[k][1] = -yr * s + yi * c;
+        }
+
+        // DSB 频域相加 + 300~3400Hz 带通掩码（层2）
+        for (int k = 0; k < nbins; k++) {
+            float r = ctx->out1[k][0] + mic2_align[k][0];
+            float i = ctx->out1[k][1] + mic2_align[k][1];
+            if (k < bin_low || k > bin_high) {
+                ctx->cs[k][0] = 0.0f;
+                ctx->cs[k][1] = 0.0f;
+            } else {
+                ctx->cs[k][0] = r;
+                ctx->cs[k][1] = i;
+            }
+        }
+
+        // IFFT
+        fftwf_execute(ctx->plan_inv);
+
+        // 重叠相加：取 xcorr[0 : fft_size]（后半段是循环混叠）
+        for (int i = 0; i < fft_size; i++) {
+            int pos = start + i;
+            if (pos < (int)total_out) {
+                out_float[pos] += ctx->xcorr[i];
+                out_norm[pos]  += ctx->window_coeffs[i % fft_size];
+            }
+        }
+    }
+
+    // 归一化：xcorr = input_len * 2ch * signal * window_overlap_sum
+    // 所以 signal = xcorr / (input_len * 2 * norm_sum)
+    int16_t* out = (int16_t*)malloc(total_out * sizeof(int16_t));
+    if (!out) { free(out_float); free(out_norm); *outLen = 0; return NULL; }
+
+    for (uint32_t i = 0; i < total_out; i++) {
+        float norm = (out_norm[i] > 1e-6f) ? out_norm[i] : 1.0f;
+        float gain = 1.5f;
+        float val = out_float[i] * gain / ((float)input_len * 2.0f * norm);
+        if (val >  32767.0f) val =  32767.0f;
+        if (val < -32768.0f) val = -32768.0f;
+        out[i] = (int16_t)val;
+    }
+
+    free(out_float);
+    free(out_norm);
+    *outLen = total_out;
+    return out;
+}
+
+
 /* ========== 三个延迟估计函数（各自独立封装） ========== */
 
 /**
@@ -163,51 +282,55 @@ static float estimate_delay_fft_phat(const int16_t* data1, uint32_t len1,
 
 /**
  * @brief 方法3：GCC-PHAT (context-based) 延迟估计
+ *
+ * 将 int16_t 输入转为 float 后委托给 gcc_phat_compute，
+ * gcc_phat_compute 内部完成：
+ *   DC去除 → Hamming加窗 → FFT → PHAT归一化 → 300~3400Hz带通掩码层1
+ *   → IFFT → 峰值搜索 → 亚采样抛物线插值
+ * 返回后 ctx->out1/out2 保留FFT结果，供 freq_domain_beamform 做频域波束成形。
  */
-static float estimate_delay_gcc_phat(const int16_t* data1, uint32_t len1,
-                                      const int16_t* data2, uint32_t len2,
-                                      int sample_rate)
+float estimate_delay_gcc_phat(const int16_t* data1, uint32_t len1,
+                                 const int16_t* data2, uint32_t len2,
+                                 int sample_rate, GccPhatContext** out_ctx)
 {
-    (void)sample_rate; /* 保留参数以备将来可能使用 */
-
-    uint32_t min_len = (len1 < len2) ? len1 : len2;
-
-    float* f1 = (float*)malloc(len1 * sizeof(float));
-    float* f2 = (float*)malloc(len2 * sizeof(float));
-    if (!f1 || !f2) {
-        fprintf(stderr, "Memory allocation failed\n");
-        free(f1); free(f2);
-        return 0.0f;
-    }
-    for (uint32_t i = 0; i < len1; i++) f1[i] = (float)data1[i] / 32768.0f;
-    for (uint32_t i = 0; i < len2; i++) f2[i] = (float)data2[i] / 32768.0f;
-
+    // 选用1024点FFT，可按需调整
     int fft_size = 1024;
-    int max_delay = 10;
-    int sig_len = (int)min_len;
-
-    if (sig_len < fft_size) {
-        fft_size = 1;
-        while (fft_size * 2 <= sig_len) fft_size *= 2;
-        printf("  Adjusting fft_size to %d (signal too short)\n", fft_size);
+    GccPhatContext* ctx = malloc(sizeof(GccPhatContext));
+    if(gcc_phat_init(ctx, fft_size) != 0)
+    {
+        free(ctx);
+        *out_ctx = NULL;
+        return NAN;
     }
-    if (max_delay >= sig_len)
-        max_delay = sig_len / 4;
 
-    printf("  Parameters: fft_size=%d, max_delay=%d\n", fft_size, max_delay);
+    // 将int16转float临时数组
+    uint32_t copy_len = (len1 < len2) ? len1 : len2;
+    int window_len = (copy_len < fft_size) ? copy_len : fft_size;
 
-    GccPhatContext gctx;
-    if (gcc_phat_init(&gctx, fft_size) != 0) {
-        fprintf(stderr, "GCC-PHAT init failed\n");
+    float* f1 = (float*)malloc(window_len * sizeof(float));
+    float* f2 = (float*)malloc(window_len * sizeof(float));
+    if(!f1 || !f2)
+    {
         free(f1); free(f2);
-        return 0.0f;
+        gcc_phat_destroy(ctx);
+        free(ctx);
+        *out_ctx = NULL;
+        return NAN;
     }
-    float estimated_delay = gcc_phat_compute(&gctx, f1, f2, sig_len, max_delay);
-    gcc_phat_destroy(&gctx);
+    for(int i = 0; i < window_len; i++)
+    {
+        f1[i] = (float)data1[i];
+        f2[i] = (float)data2[i];
+    }
 
-    printf("GCC-PHAT estimated delay: %.4f samples\n", estimated_delay);
+    // gcc_phat_compute 内部：DC去除/加窗/FFT/PHAT/带通掩码/IFFT/峰值搜索+亚采样插值
+    float estimated_delay = gcc_phat_compute(ctx, f1, f2, window_len, fft_size / 2, sample_rate);
 
-    free(f1); free(f2);
+    free(f1);
+    free(f2);
+
+    // ctx->out1/out2 保留FFT结果，供 freq_domain_beamform 使用
+    *out_ctx = ctx;
     return estimated_delay;
 }
 
@@ -232,10 +355,10 @@ static float estimate_delay_gcc_phat(const int16_t* data1, uint32_t len1,
  */
 float estimate_delay_interactive(const int16_t* data1, uint32_t len1,
                                  const int16_t* data2, uint32_t len2,
-                                 int sample_rate)
+                                 int sample_rate, GccPhatContext** out_ctx)
 {
     /* 当前使用 ---- GCC-PHAT ----------------------------------- */
-    float estimated_delay = estimate_delay_gcc_phat(data1, len1, data2, len2, sample_rate);
+    float estimated_delay = estimate_delay_gcc_phat(data1, len1, data2, len2, sample_rate, out_ctx);
     /* ---------------------------------------------------------- */
 
     /*

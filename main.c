@@ -16,7 +16,8 @@
 #include "include/read_pcm.h"     // audio_load / audio_free
 #include "include/readwav.h"      // write_wav
 #include "include/delay_and_sum.h"// estimate_delay_interactive / delay_sum
-#include "include/file_utils.h"   // ensure_audio_dir / build_audio_path
+#include "include/file_utils.h"   // ensure_audio_dir
+// gcc_phat_delay.h 已通过 delay_and_sum.h 间接包含
 #include <string.h>
 
 static int is_wav_file(const char* path)
@@ -105,32 +106,43 @@ int do_work(int argc, char* argv[])
     }
 
     /* ---- 延迟估计 ---- */
+    GccPhatContext* gctx = NULL;
+    float est;
+    float est_comp = 0.0f;
     if (!manual_delay) {
         printf("Auto-calculating delay...\n");
-        float est = estimate_delay_interactive(a1->data, a1->num_samples,
-                                              a2->data, a2->num_samples,
-                                              (int)a1->sample_rate);
+        est = estimate_delay_interactive(a1->data, a1->num_samples,
+                                        a2->data, a2->num_samples,
+                                        (int)a1->sample_rate, &gctx);
         if (est >= 0.0f) {
-            delay1 = 0.0f;
-            delay2 = est;
+            // mic2滞后est，旋转mic2频谱 -est
+            est_comp = est;
         } else {
-            delay1 = -est;
-            delay2 = 0.0f;
+            // mic2超前|est|，旋转mic2频谱 |est|
+            est_comp = est;
         }
-        printf("Applied delay: delay1=%.4f, delay2=%.4f\n", delay1, delay2);
+        printf("Estimated delay for freq rotation: %.4f\n", est_comp);
+    } else {
+        // 手动时延场景，单独初始化GccPhatContext做FFT
+        gctx = malloc(sizeof(GccPhatContext));
+        gcc_phat_init(gctx, 1024);
+        // 填充data1/data2到gctx->in1/in2并执行FFT
+        est_comp = delay2;
     }
 
     /* ---- 波束成形 ---- */
     uint32_t outLen;
-    int16_t* outData = delay_sum(a1->data, a1->num_samples, delay1,
-                                 a2->data, a2->num_samples, delay2, &outLen);
+    int16_t* outData = freq_domain_beamform(gctx,
+                                        a1->data, a1->num_samples,
+                                        a2->data, a2->num_samples,
+                                        est_comp, a1->sample_rate, &outLen);
     if (!outData) {
         audio_free(a1); audio_free(a2);
         return 1;
     }
 
-    /* ---- 写 WAV 输出 ---- */
-    char* outPath = build_audio_path(outFile);
+    /* ---- 写 WAV 输出（直接使用用户指定的路径，不强制目录前缀） ---- */
+    char* outPath = strdup(outFile);
     WAVHeader h;
     memset(&h, 0, sizeof(WAVHeader));
     memcpy(h.chunkID, "RIFF", 4);

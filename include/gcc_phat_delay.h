@@ -51,7 +51,8 @@ int gcc_phat_init(GccPhatContext *ctx, int fft_size);
  */
 float gcc_phat_compute(GccPhatContext *ctx,
                        const float *sig1, const float *sig2,
-                       int len, int max_delay);
+                       int len, int max_delay,
+                       int sample_rate);
 
 /**
  * @brief 销毁 GCC-PHAT 上下文，释放所有资源
