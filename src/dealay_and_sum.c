@@ -1,6 +1,7 @@
 #include "../include/setting.h"
 #include "../include/fft_path.h"
 #include "../include/gcc_phat_delay.h"
+#include "../include/mmse_lsa.h"
 
 // 计算互相关，估计第二个信号相对于第一个信号的延迟（样本数）
 // 返回值：延迟 d，满足 y[n] ≈ x[n-d] (d>0表示y滞后于x)
@@ -114,6 +115,10 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     int nbins     = ctx->complex_len;   // fft_size + 1
     int hop       = fft_size / 2;       // 50% 重叠
 
+    // 初始化MMSE-LSA
+    MmseLsaCtx lsa;
+    lsa_init(&lsa, nbins);
+
     // 人声带通边界
     float bin_hz = (float)fs / (float)input_len;
     int bin_low  = (int)ceilf(300.0f / bin_hz);
@@ -157,6 +162,41 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         fftwf_execute(ctx->plan_fwd1);
         fftwf_execute(ctx->plan_fwd2);
 
+        // ========== FFT后立刻预滚降带通，从源头削弱低频噪声 ==========
+        float bin_hz = (float)fs / (float)input_len;
+        int roll_off_bins = 8;
+        for (int k = 0; k < nbins; k++)
+        {
+            float gain = 1.0f;
+            if (k < bin_low - roll_off_bins)
+                gain = 0.0f;
+            else if (k < bin_low)
+                gain = (float)(k - (bin_low - roll_off_bins)) / roll_off_bins;
+            else if (k > bin_high)
+                gain = 0.0f;
+            // 直接衰减原始麦克风频谱，低频噪声不再参与相位旋转、求和
+            ctx->out1[k][0] *= gain;
+            ctx->out1[k][1] *= gain;
+            ctx->out2[k][0] *= gain;
+            ctx->out2[k][1] *= gain;
+        }
+
+        // 检测到噪声为约50Hz工频，可根据实际波形修改频率
+        float target_noise_freq = 25.0f;
+        int center_bin = roundf(target_noise_freq / bin_hz);
+        // 左右各2根邻频bin全部清零，彻底消除正弦波纹
+        for(int offset = -2; offset <= 2; offset++)
+        {
+            int k = center_bin + offset;
+            if(k >= 0 && k < nbins)
+            {
+                ctx->out1[k][0] = 0.0f;
+                ctx->out1[k][1] = 0.0f;
+                ctx->out2[k][0] = 0.0f;
+                ctx->out2[k][1] = 0.0f;
+            }
+        }
+
         // 相位旋转补偿亚采样延迟（复制 mic2 频谱用于旋转）
         fftwf_complex mic2_align[nbins];
         memcpy(mic2_align, ctx->out2, sizeof(fftwf_complex) * nbins);
@@ -169,11 +209,25 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
             mic2_align[k][1] = -yr * s + yi * c;
         }
 
-        // DSB 频域相加 + 300~3400Hz 带通掩码（层2）
+        // ========== 只保留一次循环：DSB相加 + 相干门限 + 带通双重过滤 ==========
+        float coh_thresh_beam = 0.35f;
         for (int k = 0; k < nbins; k++) {
-            float r = ctx->out1[k][0] + mic2_align[k][0];
-            float i = ctx->out1[k][1] + mic2_align[k][1];
-            if (k < bin_low || k > bin_high) {
+            // 两路对齐频谱相加
+            float re_x = ctx->out1[k][0], im_x = ctx->out1[k][1];
+            float re_y = mic2_align[k][0], im_y = mic2_align[k][1];
+            float r = re_x + re_y;
+            float i = im_x + im_y;
+
+            // 逐频点计算相干系数
+            float Pxx = re_x*re_x + im_x*im_x;
+            float Pyy = re_y*re_y + im_y*im_y;
+            float re_xy = re_x*re_y + im_x*im_y;
+            float im_xy = im_x*re_y - re_x*im_y;
+            float Pxy_sq = re_xy*re_xy + im_xy*im_xy;
+            float gamma = (Pxx*Pyy > 1e-12f) ? Pxy_sq/(Pxx*Pyy) : 0.0f;
+
+            // 带通 + 相干联合过滤
+            if((k < bin_low || k > bin_high) || gamma < coh_thresh_beam) {
                 ctx->cs[k][0] = 0.0f;
                 ctx->cs[k][1] = 0.0f;
             } else {
@@ -181,6 +235,9 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
                 ctx->cs[k][1] = i;
             }
         }
+
+        //MMSE_LSA频域降噪
+        lsa_process_frame(&lsa, ctx->cs);
 
         // IFFT
         fftwf_execute(ctx->plan_inv);

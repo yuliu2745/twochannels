@@ -117,6 +117,11 @@ float gcc_phat_compute(GccPhatContext *ctx,
 
     /* ---------- GCC-PHAT 核心 ---------- */
     int nbins = ctx->complex_len;
+    //计算人声带通边界
+    float bin_hz = (float)sample_rate / ctx->input_len;
+    int bin_low  = (int)ceilf(300.0f / bin_hz);
+    int bin_high = (int)floorf(3400.0f / bin_hz);
+    const float coh_threshold = 0.40f; // 相干阈值，低于该值判定为噪声频点
     for (int i = 0; i < nbins; i++) {
         float re_x = ctx->out1[i][0];
         float im_x = ctx->out1[i][1];
@@ -136,21 +141,26 @@ float gcc_phat_compute(GccPhatContext *ctx,
             ctx->cs[i][0] = 0.0f;
             ctx->cs[i][1] = 0.0f;
         }
-    }
 
-    // ====================== 层1：300~3400Hz 带通掩码（优化时延估计精度） ======================
-    // 使用调用方传入的 sample_rate，而非硬编码值
-    float bin_hz = (float)sample_rate / (float)ctx->input_len; // input_len = 2*fft_size，R2C频点分辨率
-    int bin_low  = (int)ceilf(300.0f / bin_hz);
-    int bin_high = (int)floorf(3400.0f / bin_hz);
-    for(int k = 0; k < nbins; k++)
-    {
-        if(k < bin_low || k > bin_high)
+        //计算两路频点相干系数
+        float Pxx = re_x * re_x + im_x * im_x;
+        float Pyy = re_y * re_y + im_y * im_y;
+        float Pxy_abs_sq = re_cs * re_cs + im_cs * im_cs;
+        float denom = Pxx * Pyy;
+        float gamma = 0.0f;
+        if (denom > 1e-12f)
         {
-            ctx->cs[k][0] = 0.0f;
-            ctx->cs[k][1] = 0.0f;
+            gamma = Pxy_abs_sq / denom;
+        }
+
+        // 不在人声频段 或 相干过低（反射/单通道噪声），频谱直接清零
+        if ((i < bin_low || i > bin_high) || (gamma < coh_threshold))
+        {
+            ctx->cs[i][0] = 0.0f;
+            ctx->cs[i][1] = 0.0f;
         }
     }
+
     
     /* ---------- 逆 FFT ---------- */
     fftwf_execute(ctx->plan_inv);
