@@ -1,6 +1,7 @@
 #include "../include/setting.h"
 #include "../include/fft_path.h"
 #include "../include/gcc_phat_delay.h"
+#include "../include/gsc.h"
 
 // 计算互相关，估计第二个信号相对于第一个信号的延迟（样本数）
 // 返回值：延迟 d，满足 y[n] ≈ x[n-d] (d>0表示y滞后于x)
@@ -135,6 +136,15 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         *outLen = 0; return NULL;
     }
 
+    // 初始化 GSC（频域自适应噪声对消）
+    // mu=0.15 控制自适应速度, alpha=0.9 功率平滑, beta=3.0 频点VAD门限
+    GscContext* gsc = gsc_init(nbins, 0.08f, 0.92f, 1.2f);
+    if (!gsc) {
+        free(out_float); free(out_norm);
+        *outLen = 0;
+        return NULL;
+    }
+
     for (int f = 0; f < nframes; f++)
     {
         int start = f * hop;
@@ -161,24 +171,25 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         fftwf_complex mic2_align[nbins];
         memcpy(mic2_align, ctx->out2, sizeof(fftwf_complex) * nbins);
         for (int k = 0; k < nbins; k++) {
-            float omega = 2.0f * (float)M_PI * k / (float)input_len;
-            float phase = omega * delay;
+            float omega_k = 2.0f * (float)3.14159265358979323846f * k / (float)input_len;
+            float phase = omega_k * delay;
             float c = cosf(phase), s = sinf(phase);
             float yr = mic2_align[k][0], yi = mic2_align[k][1];
             mic2_align[k][0] = yr * c + yi * s;
             mic2_align[k][1] = -yr * s + yi * c;
         }
 
-        // DSB 频域相加 + 300~3400Hz 带通掩码（层2）
+        // GSC 频域自适应噪声对消（替代原来的简单 DSB 相加）
+        //   Speech ref:  S = (X1 + X2_rotated) / 2
+        //   Noise ref:   N = (X1 - X2_rotated) / 2
+        //   GSC output:  Y = S - W * N   (乘以 2 保持幅度一致性)
+        gsc_process_frame(gsc, ctx->out1, mic2_align, ctx->cs, nbins);
+
+        // 300~3400Hz 带通掩码（层2），放在 GSC 之后以抑制带外残留
         for (int k = 0; k < nbins; k++) {
-            float r = ctx->out1[k][0] + mic2_align[k][0];
-            float i = ctx->out1[k][1] + mic2_align[k][1];
             if (k < bin_low || k > bin_high) {
                 ctx->cs[k][0] = 0.0f;
                 ctx->cs[k][1] = 0.0f;
-            } else {
-                ctx->cs[k][0] = r;
-                ctx->cs[k][1] = i;
             }
         }
 
@@ -195,6 +206,9 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         }
     }
 
+    // 销毁 GSC 上下文
+    gsc_destroy(gsc);
+
     // 归一化：xcorr = input_len * 2ch * signal * window_overlap_sum
     // 所以 signal = xcorr / (input_len * 2 * norm_sum)
     int16_t* out = (int16_t*)malloc(total_out * sizeof(int16_t));
@@ -202,8 +216,8 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
 
     for (uint32_t i = 0; i < total_out; i++) {
         float norm = (out_norm[i] > 1e-6f) ? out_norm[i] : 1.0f;
-        float gain = 1.5f;
-        float val = out_float[i] * gain / ((float)input_len * 2.0f * norm);
+        float gain = 1.2f;
+        float val = out_float[i] * gain / ((float)input_len * norm);
         if (val >  32767.0f) val =  32767.0f;
         if (val < -32768.0f) val = -32768.0f;
         out[i] = (int16_t)val;

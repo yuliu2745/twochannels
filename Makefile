@@ -18,6 +18,7 @@ INC_DIR = include
 
 # Source files (无main的公共工具源码)
 SRCS = $(SRC_DIR)/readwav.c \
+       $(SRC_DIR)/gsc.c \
        $(SRC_DIR)/read_pcm.c \
        $(SRC_DIR)/dealay_and_sum.c \
        $(SRC_DIR)/fft_path.c \
