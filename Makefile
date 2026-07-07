@@ -24,7 +24,8 @@ SRCS = $(SRC_DIR)/readwav.c \
        $(SRC_DIR)/fft_path.c \
        $(SRC_DIR)/gcc_phat_delay.c \
        $(SRC_DIR)/file_utils.c \
-       $(SRC_DIR)/merge_audio.c
+       $(SRC_DIR)/merge_audio.c \
+       $(SRC_DIR)/mmse_lsa.c
 
 # 把src下所有.c映射到 obj/src_xxx.o，统一放obj目录
 OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/src_%.o, $(SRCS))

@@ -2,6 +2,12 @@
 #include "../include/fft_path.h"
 #include "../include/gcc_phat_delay.h"
 #include "../include/gsc.h"
+#include "../include/mmse_lsa.h"
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 // 计算互相关，估计第二个信号相对于第一个信号的延迟（样本数）
 // 返回值：延迟 d，满足 y[n] ≈ x[n-d] (d>0表示y滞后于x)
@@ -115,9 +121,10 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     int nbins     = ctx->complex_len;   // fft_size + 1
     int hop       = fft_size / 2;       // 50% 重叠
 
-    // 人声带通边界
+    // 人声带通边界 + 过渡段
     float bin_hz = (float)fs / (float)input_len;
     int bin_low  = (int)ceilf(300.0f / bin_hz);
+    int bin_mid  = (int)floorf(500.0f / bin_hz);  // 过渡段上限
     int bin_high = (int)floorf(3400.0f / bin_hz);
 
     uint32_t min_len = (len1 < len2) ? len1 : len2;
@@ -137,8 +144,18 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     }
 
     // 初始化 GSC（频域自适应噪声对消）
-    // mu=0.15 控制自适应速度, alpha=0.9 功率平滑, beta=3.0 频点VAD门限
-    GscContext* gsc = gsc_init(nbins, 0.04f, 0.92f, 0.8f);
+    // mu=0.02 控制自适应速度, alpha=0.92 功率平滑, beta=0.4 频点VAD门限
+    // leak=0.9995 语音帧缓慢衰减 W，减少人声泄漏抵消
+    GscContext* gsc = gsc_init(nbins, 0.02f, 0.92f, 0.4f, 0.9995f);
+    if (!gsc) {
+        free(out_float); free(out_norm);
+        *outLen = 0;
+        return NULL;
+    }
+
+    // 初始化后置 MMSE-LSA（降 GSC 残留的不相关底噪）
+    MmseLsaCtx lsa;
+    lsa_init(&lsa, nbins);
     if (!gsc) {
         free(out_float); free(out_norm);
         *outLen = 0;
@@ -185,11 +202,18 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         //   GSC output:  Y = S - W * N   (乘以 2 保持幅度一致性)
         gsc_process_frame(gsc, ctx->out1, mic2_align, ctx->cs, nbins);
 
-        // 300~3400Hz 带通掩码（层2），放在 GSC 之后以抑制带外残留
+        // 后置 MMSE-LSA 降噪：消除 GSC 无法处理的不相关底噪
+        lsa_process_frame(&lsa, ctx->cs);
+
+        // 300~3400Hz 带通掩码（层2）+ 300~500Hz 温和衰减（-9dB, 不置零）
         for (int k = 0; k < nbins; k++) {
             if (k < bin_low || k > bin_high) {
                 ctx->cs[k][0] = 0.0f;
                 ctx->cs[k][1] = 0.0f;
+            } else if (k <= bin_mid) {
+                // 300~500Hz：仅 -9dB 衰减，保住 183Hz 人声主峰能量
+                ctx->cs[k][0] *= 0.35f;
+                ctx->cs[k][1] *= 0.35f;
             }
         }
 
@@ -214,10 +238,94 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     int16_t* out = (int16_t*)malloc(total_out * sizeof(int16_t));
     if (!out) { free(out_float); free(out_norm); *outLen = 0; return NULL; }
 
+    /* ========== 输出时域滤波器链 ========== */
+
+    // 1. 二阶 IIR 高通（Butterworth, fc=80Hz），消除 0-50Hz 帧处理低频泄漏
+    float w0 = 2.0f * (float)M_PI * 80.0f / (float)fs;
+    float alpha_hp = sinf(w0) * 0.70710678f;
+    float a0_hp = 1.0f + alpha_hp;
+    float hpf_b0 =  (1.0f + cosf(w0)) / (2.0f * a0_hp);
+    float hpf_b1 = -(1.0f + cosf(w0)) / a0_hp;
+    float hpf_b2 =  (1.0f + cosf(w0)) / (2.0f * a0_hp);
+    float hpf_a1 = -2.0f * cosf(w0) / a0_hp;
+    float hpf_a2 =  (1.0f - alpha_hp) / a0_hp;
+    float hp_x1 = 0.0f, hp_x2 = 0.0f, hp_y1 = 0.0f, hp_y2 = 0.0f;
+
+    // 2. 自适应 50Hz 窄带陷波（Q=15），消除工频谐波
+    float notch_Q = 15.0f;
+    float w0_50 = 2.0f * (float)M_PI * 50.0f / (float)fs;
+    float alpha_50 = sinf(w0_50) / (2.0f * notch_Q);
+    float a0_50 = 1.0f + alpha_50;
+    float n50_b0 = 1.0f / a0_50;
+    float n50_b1 = -2.0f * cosf(w0_50) / a0_50;
+    float n50_b2 = 1.0f / a0_50;
+    float n50_a1 = n50_b1;    /* b1/a0 == -2cos(w0)/a0 */
+    float n50_a2 = (1.0f - alpha_50) / a0_50;
+    float n50_x1 = 0.0f, n50_x2 = 0.0f, n50_y1 = 0.0f, n50_y2 = 0.0f;
+
+    // 3. 自适应 100Hz 窄带陷波（Q=15），消除工频二次谐波
+    float w0_100 = 2.0f * (float)M_PI * 100.0f / (float)fs;
+    float alpha_100 = sinf(w0_100) / (2.0f * notch_Q);
+    float a0_100 = 1.0f + alpha_100;
+    float n100_b0 = 1.0f / a0_100;
+    float n100_b1 = -2.0f * cosf(w0_100) / a0_100;
+    float n100_b2 = 1.0f / a0_100;
+    float n100_a1 = n100_b1;
+    float n100_a2 = (1.0f - alpha_100) / a0_100;
+    float n100_x1 = 0.0f, n100_x2 = 0.0f, n100_y1 = 0.0f, n100_y2 = 0.0f;
+
+    // 4. 高频搁架（High-shelf, fc=1.2kHz, +6dB），还原齿音/辅音清晰度
+    float hs_gain_db = 6.0f;
+    float A_hs = powf(10.0f, hs_gain_db / 40.0f);  /* A = 10^(dB/40) */
+    float w0_hs = 2.0f * (float)M_PI * 1200.0f / (float)fs;
+    float alpha_hs = sinf(w0_hs) * 0.70710678f;    /* S=1 → alpha = sin(w0)/√2 */
+    float cos_hs = cosf(w0_hs);
+    float sqrtA = sqrtf(A_hs);
+    float hs_b0 = A_hs * ((A_hs+1.0f) + (A_hs-1.0f)*cos_hs + 2.0f*sqrtA*alpha_hs);
+    float hs_b1 = -2.0f*A_hs * ((A_hs-1.0f) + (A_hs+1.0f)*cos_hs);
+    float hs_b2 = A_hs * ((A_hs+1.0f) + (A_hs-1.0f)*cos_hs - 2.0f*sqrtA*alpha_hs);
+    float hs_a0 = (A_hs+1.0f) - (A_hs-1.0f)*cos_hs + 2.0f*sqrtA*alpha_hs;
+    float hs_a1 = 2.0f * ((A_hs-1.0f) - (A_hs+1.0f)*cos_hs);
+    float hs_a2 = (A_hs+1.0f) - (A_hs-1.0f)*cos_hs - 2.0f*sqrtA*alpha_hs;
+    /* 归一化到 a0 */
+    float hs_b0n = hs_b0 / hs_a0, hs_b1n = hs_b1 / hs_a0, hs_b2n = hs_b2 / hs_a0;
+    float hs_a1n = hs_a1 / hs_a0, hs_a2n = hs_a2 / hs_a0;
+    float hs_x1 = 0.0f, hs_x2 = 0.0f, hs_y1 = 0.0f, hs_y2 = 0.0f;
+
     for (uint32_t i = 0; i < total_out; i++) {
         float norm = (out_norm[i] > 1e-6f) ? out_norm[i] : 1.0f;
-        float gain = 1.2f;
-        float val = out_float[i] * gain / ((float)input_len * norm);
+        float val = out_float[i] / ((float)input_len * norm);
+
+        // ① 80Hz 高通 —— 消除 0-50Hz 帧处理低频泄漏
+        float out_hp = hpf_b0*val + hpf_b1*hp_x1 + hpf_b2*hp_x2
+                     - hpf_a1*hp_y1 - hpf_a2*hp_y2;
+        hp_x2 = hp_x1; hp_x1 = val;
+        hp_y2 = hp_y1; hp_y1 = out_hp;
+        val = out_hp;
+
+        // ② 50Hz 窄带陷波 —— 消除工频基波
+        float out_n50 = n50_b0*val + n50_b1*n50_x1 + n50_b2*n50_x2
+                      - n50_a1*n50_y1 - n50_a2*n50_y2;
+        n50_x2 = n50_x1; n50_x1 = val;
+        n50_y2 = n50_y1; n50_y1 = out_n50;
+        val = out_n50;
+
+        // ③ 100Hz 窄带陷波 —— 消除工频二次谐波
+        float out_n100 = n100_b0*val + n100_b1*n100_x1 + n100_b2*n100_x2
+                       - n100_a1*n100_y1 - n100_a2*n100_y2;
+        n100_x2 = n100_x1; n100_x1 = val;
+        n100_y2 = n100_y1; n100_y1 = out_n100;
+        val = out_n100;
+
+        // ④ 1.2kHz 高频搁架 +6dB —— 还原齿音/清辅音清晰度
+        float out_hs = hs_b0n*val + hs_b1n*hs_x1 + hs_b2n*hs_x2
+                     - hs_a1n*hs_y1 - hs_a2n*hs_y2;
+        hs_x2 = hs_x1; hs_x1 = val;
+        hs_y2 = hs_y1; hs_y1 = out_hs;
+        val = out_hs;
+
+        // 幅度恢复 + 钳位
+        val *= 1.5f;
         if (val >  32767.0f) val =  32767.0f;
         if (val < -32768.0f) val = -32768.0f;
         out[i] = (int16_t)val;

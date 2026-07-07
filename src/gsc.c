@@ -27,7 +27,7 @@
 /*  Init                                                               */
 /* ------------------------------------------------------------------ */
 
-GscContext* gsc_init(int complex_len, float mu, float alpha, float vad_thresh)
+GscContext* gsc_init(int complex_len, float mu, float alpha, float vad_thresh, float leak)
 {
     if (complex_len < 2)
         return NULL;
@@ -52,6 +52,7 @@ GscContext* gsc_init(int complex_len, float mu, float alpha, float vad_thresh)
     gsc->mu           = mu;
     gsc->alpha        = alpha;
     gsc->vad_thresh   = vad_thresh;
+    gsc->leak         = leak;
 
     return gsc;
 }
@@ -74,6 +75,7 @@ void gsc_process_frame(GscContext *gsc,
     float mu    = gsc->mu;
     float alpha = gsc->alpha;
     float beta  = gsc->vad_thresh;
+    float leak  = gsc->leak;
 
     for (int k = 0; k < n; k++)
     {
@@ -107,6 +109,18 @@ void gsc_process_frame(GscContext *gsc,
         float pow_s = re_s * re_s + im_s * im_s;
         float pow_n = re_n * re_n + im_n * im_n;
 
+        /* ---- 首帧用 |N|² 初始化 Pn，防止初始跳变 ---- */
+        if (!gsc->initialized)
+        {
+            gsc->Pn[k] = pow_n;
+            /* W 保持 0，Y = S - 0 = S，首帧直通 */
+            Y[k][0] = re_s;
+            Y[k][1] = im_s;
+            if (k == n - 1)
+                gsc->initialized = 1;
+            continue;
+        }
+
         int speech_present = (pow_s > beta * pow_n + GSC_EPSILON) ? 1 : 0;
 
         /* ---- 泄漏 NLMS 更新（仅无语音时更新 W） ---- */
@@ -126,6 +140,12 @@ void gsc_process_frame(GscContext *gsc,
 
             gsc->W[k][0] += re_dw;
             gsc->W[k][1] += im_dw;
+        }
+        else
+        {
+            /* 语音帧：W 缓慢泄漏回零，防止泄漏到 N 中的人声被持续抵消 */
+            gsc->W[k][0] *= leak;
+            gsc->W[k][1] *= leak;
         }
 
         /* ---- 写入输出 Y（乘以 2 保持与原始 DSB 幅度一致性） ---- */

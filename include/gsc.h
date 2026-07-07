@@ -19,10 +19,12 @@
 typedef struct {
     fftwf_complex *W;       /* 复数自适应权重 (complex_len) */
     float         *Pn;      /* 噪声参考平滑功率 (complex_len) */
-    float          mu;      /* NLMS 步长 (典型值 0.1~0.3) */
+    float          mu;      /* NLMS 步长 (典型值 0.01~0.03) */
     float          alpha;   /* 功率平滑因子 (典型值 0.9) */
-    float          vad_thresh; /* 频点VAD能量比阈值 (β, 典型值 3.0) */
+    float          vad_thresh; /* 频点VAD能量比阈值 (β, 典型值 0.4~3.0) */
+    float          leak;    /* 语音帧 W 泄漏因子 (0.999~1.0), 1.0=不泄漏 */
     int            complex_len; /* 频点数 */
+    int            initialized; /* Pn 首帧已初始化标记 */
 } GscContext;
 
 /**
@@ -32,9 +34,10 @@ typedef struct {
  * @param mu           NLMS 步长
  * @param alpha        噪声功率平滑因子
  * @param vad_thresh   频点 VAD 能量比阈值，|S|² > β·|N|² 判为有语音
+ * @param leak         语音帧 W 泄漏因子 (0.999~1.0)，1.0=不泄漏
  * @return 初始化成功的指针，失败返回 NULL
  */
-GscContext* gsc_init(int complex_len, float mu, float alpha, float vad_thresh);
+GscContext* gsc_init(int complex_len, float mu, float alpha, float vad_thresh, float leak);
 
 /**
  * @brief 对一帧频域数据执行 GSC 处理
