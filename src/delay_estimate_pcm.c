@@ -200,8 +200,8 @@ int main(int argc, char* argv[]) {
 
         // 执行延迟求和
         uint32_t outLen;
-        int16_t* outData = delay_sum(data1, len1, delay1,
-                                    data2, len2, delay2, &outLen);
+        int16_t* outData = delay_sum(data1, len1, (float)delay1,
+                                    data2, len2, (float)delay2, &outLen);
         if (!outData) {
             fprintf(stderr, "Error: delay_sum failed\n");
             free(data1); free(data2); free(outPath);

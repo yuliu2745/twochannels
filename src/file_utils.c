@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 
 // 构建完整的音频文件路径
 char* build_audio_path(const char* filename) {
@@ -20,8 +21,21 @@ char* build_audio_path(const char* filename) {
 
 // 确保音频输出目录存在
 void ensure_audio_dir() {
-    // 在Windows上，如果目录不存在会自动创建
-    // 这里可以添加更多检查逻辑
+    // 递归创建目录
+    char dir[256];
+    size_t len = strlen(AUDIO_OUTPUT_DIR);
+    if (len == 0 || len >= sizeof(dir)) return;
+    memcpy(dir, AUDIO_OUTPUT_DIR, len);
+    dir[len] = '\0';
+
+    for (char *p = dir; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(dir, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(dir, 0755);  // 最后一级
 }
 
 // 获取不带路径的文件名
