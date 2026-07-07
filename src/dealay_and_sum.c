@@ -138,7 +138,7 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
 
     // 初始化 GSC（频域自适应噪声对消）
     // mu=0.15 控制自适应速度, alpha=0.9 功率平滑, beta=3.0 频点VAD门限
-    GscContext* gsc = gsc_init(nbins, 0.08f, 0.92f, 1.2f);
+    GscContext* gsc = gsc_init(nbins, 0.04f, 0.92f, 0.8f);
     if (!gsc) {
         free(out_float); free(out_norm);
         *outLen = 0;
