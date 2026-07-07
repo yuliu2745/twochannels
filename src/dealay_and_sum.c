@@ -146,7 +146,8 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     // 初始化 GSC（频域自适应噪声对消）
     // mu=0.02 控制自适应速度, alpha=0.92 功率平滑, beta=0.4 频点VAD门限
     // leak=0.9995 语音帧缓慢衰减 W，减少人声泄漏抵消
-    GscContext* gsc = gsc_init(nbins, 0.02f, 0.92f, 0.4f, 0.9995f);
+    // smooth_factor=0.7 BM泄漏维纳增益平滑（快速跟踪）
+    GscContext* gsc = gsc_init(nbins, 0.02f, 0.92f, 0.4f, 0.9995f, 0.70f);
     if (!gsc) {
         free(out_float); free(out_norm);
         *outLen = 0;
