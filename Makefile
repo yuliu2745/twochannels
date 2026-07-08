@@ -18,14 +18,15 @@ INC_DIR = include
 
 # Source files (无main的公共工具源码)
 SRCS = $(SRC_DIR)/readwav.c \
-       $(SRC_DIR)/gsc.c \
+       $(SRC_DIR)/tf_gsc.c \
        $(SRC_DIR)/read_pcm.c \
        $(SRC_DIR)/dealay_and_sum.c \
        $(SRC_DIR)/fft_path.c \
        $(SRC_DIR)/gcc_phat_delay.c \
        $(SRC_DIR)/file_utils.c \
        $(SRC_DIR)/merge_audio.c \
-       $(SRC_DIR)/mmse_lsa.c
+       $(SRC_DIR)/mmse_lsa.c \
+       $(SRC_DIR)/signal_restore.c
 
 # 把src下所有.c映射到 obj/src_xxx.o，统一放obj目录
 OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/src_%.o, $(SRCS))

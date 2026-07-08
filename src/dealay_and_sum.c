@@ -1,8 +1,9 @@
 #include "../include/setting.h"
 #include "../include/fft_path.h"
 #include "../include/gcc_phat_delay.h"
-#include "../include/gsc.h"
+#include "../include/tf_gsc.h"
 #include "../include/mmse_lsa.h"
+#include "../include/signal_restore.h"
 #include <math.h>
 
 #ifndef M_PI
@@ -143,25 +144,24 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         *outLen = 0; return NULL;
     }
 
-    // 初始化 GSC（频域自适应噪声对消）
-    // mu=0.02 控制自适应速度, alpha=0.92 功率平滑, beta=0.4 频点VAD门限
+    // 初始化 TF-GSC（频域自适应噪声对消）
+    // mu=0.01 控制自适应速度, alpha=0.92 功率平滑, beta=0.4 频点VAD门限
     // leak=0.9995 语音帧缓慢衰减 W，减少人声泄漏抵消
     // smooth_factor=0.7 BM泄漏维纳增益平滑（快速跟踪）
-    GscContext* gsc = gsc_init(nbins, 0.02f, 0.92f, 0.4f, 0.9995f, 0.70f);
-    if (!gsc) {
+    TfGscContext* tf_gsc = tf_gsc_init(nbins, 0.01f, 0.92f, 0.4f, 0.9995f, 0.70f);
+    if (!tf_gsc) {
         free(out_float); free(out_norm);
         *outLen = 0;
         return NULL;
     }
 
-    // 初始化后置 MMSE-LSA（降 GSC 残留的不相关底噪）
+    // 初始化后置 MMSE-LSA（降 TF-GSC 残留的不相关底噪）
     MmseLsaCtx lsa;
     lsa_init(&lsa, nbins);
-    if (!gsc) {
-        free(out_float); free(out_norm);
-        *outLen = 0;
-        return NULL;
-    }
+
+    // 初始化信号恢复模块（补偿波束成形对期望语音的损伤）
+    // lambda=0.85 余弦相似度平滑, eta=0.1 决策阈值, beta=10.0 保守增益
+    SignalRestoreContext *restore = restore_init(nbins, 0.85f, 0.05f, 10.0f);
 
     for (int f = 0; f < nframes; f++)
     {
@@ -197,13 +197,24 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
             mic2_align[k][1] = -yr * s + yi * c;
         }
 
-        // GSC 频域自适应噪声对消（替代原来的简单 DSB 相加）
-        //   Speech ref:  S = (X1 + X2_rotated) / 2
-        //   Noise ref:   N = (X1 - X2_rotated) / 2
-        //   GSC output:  Y = S - W * N   (乘以 2 保持幅度一致性)
-        gsc_process_frame(gsc, ctx->out1, mic2_align, ctx->cs, nbins);
+        // TF-GSC 频域自适应噪声对消
+        //   同时输出: Y_FBF = S (FBF 主波束), Y_U = Ñ (净化噪声参考)
+        fftwf_complex y_fbf[nbins], y_u[nbins];
+        tf_gsc_process_frame(tf_gsc, ctx->out1, mic2_align, y_fbf, y_u, ctx->cs, nbins);
 
-        // 后置 MMSE-LSA 降噪：消除 GSC 无法处理的不相关底噪
+        // 信号恢复模块：根据余弦相似度选择麦克信号，补偿 FBF 对期望语音的损伤
+        //   Y_bar_FBF = Y_FBF + G_X · X_selected
+        //   最终输出叠加: Y_GSC + (Y_bar_FBF - Y_FBF) = Y_GSC + G_X · X_selected
+        if (restore) {
+            fftwf_complex y_restored[nbins];
+            restore_process_frame(restore, y_fbf, y_u, ctx->out1, mic2_align, y_restored, nbins);
+            for (int k = 0; k < nbins; k++) {
+                ctx->cs[k][0] += y_restored[k][0] - y_fbf[k][0];
+                ctx->cs[k][1] += y_restored[k][1] - y_fbf[k][1];
+            }
+        }
+
+        // 后置 MMSE-LSA 降噪：消除 TF-GSC 无法处理的不相关底噪
         lsa_process_frame(&lsa, ctx->cs);
 
         // 300~3400Hz 带通掩码（层2）+ 300~500Hz 温和衰减（-9dB, 不置零）
@@ -231,8 +242,8 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         }
     }
 
-    // 销毁 GSC 上下文
-    gsc_destroy(gsc);
+    // 销毁 TF-GSC 上下文
+    tf_gsc_destroy(tf_gsc);
 
     // 归一化：xcorr = input_len * 2ch * signal * window_overlap_sum
     // 所以 signal = xcorr / (input_len * 2 * norm_sum)
