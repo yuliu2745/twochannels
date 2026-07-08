@@ -10,7 +10,7 @@ void lsa_init(MmseLsaCtx* lsa, int nbins)
     lsa->bin_count = nbins;
     lsa->alpha_noise = 0.95f;      // 平滑更新避免语音泄漏
     lsa->alpha_speech = 0.85f;
-    lsa->vad_snr_thresh = 3.0f;    // 高门限，仅确信静音帧才更新噪声谱
+    lsa->vad_snr_thresh = 2.0f;    // 中门限（原 3.0），弱辅音帧不被误判为噪声
     lsa->max_attenuation = 0.10f;  // -20dB，温和降噪，减少吞音
     lsa->initialized = 0;
 }

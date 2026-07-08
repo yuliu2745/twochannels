@@ -125,7 +125,6 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     // 人声带通边界 + 过渡段
     float bin_hz = (float)fs / (float)input_len;
     int bin_low  = (int)ceilf(300.0f / bin_hz);
-    int bin_mid  = (int)floorf(500.0f / bin_hz);  // 过渡段上限
     int bin_high = (int)floorf(3400.0f / bin_hz);
 
     uint32_t min_len = (len1 < len2) ? len1 : len2;
@@ -160,8 +159,9 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     lsa_init(&lsa, nbins);
 
     // 初始化信号恢复模块（补偿波束成形对期望语音的损伤）
-    // lambda=0.85 余弦相似度平滑, eta=0.1 决策阈值, beta=10.0 保守增益
-    SignalRestoreContext *restore = restore_init(nbins, 0.85f, 0.05f, 10.0f);
+    // lambda=0.88 余弦相似度平滑, eta=0.10/0.03 三段式补偿,
+    // beta_low=10(低SNR冻结), beta_high=5(高SNR适度增强), SNR门限=15dB
+    SignalRestoreContext *restore = restore_init(nbins, 0.88f, 0.10f, 0.03f, 10.0f, 5.0f, 15.0f);
 
     for (int f = 0; f < nframes; f++)
     {
@@ -217,15 +217,11 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         // 后置 MMSE-LSA 降噪：消除 TF-GSC 无法处理的不相关底噪
         lsa_process_frame(&lsa, ctx->cs);
 
-        // 300~3400Hz 带通掩码（层2）+ 300~500Hz 温和衰减（-9dB, 不置零）
+        // 300~3400Hz 带通掩码（300~500Hz 直通，不再衰减）
         for (int k = 0; k < nbins; k++) {
             if (k < bin_low || k > bin_high) {
                 ctx->cs[k][0] = 0.0f;
                 ctx->cs[k][1] = 0.0f;
-            } else if (k <= bin_mid) {
-                // 300~500Hz：仅 -9dB 衰减，保住 183Hz 人声主峰能量
-                ctx->cs[k][0] *= 0.35f;
-                ctx->cs[k][1] *= 0.35f;
             }
         }
 

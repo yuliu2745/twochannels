@@ -22,13 +22,21 @@ typedef struct {
     float         *Pn;      /* 噪声参考平滑功率 (complex_len) */
     float         *G_smooth; /* 逐频点维纳增益(平滑后)，用于BM泄漏抑制 */
     float         *S_floor;  /* 语音参考功率噪声底 (complex_len)，缓慢跟踪最小值 */
-    float          mu;      /* NLMS 步长 (典型值 0.01~0.03) */
+    float          mu;      /* NLMS 基准步长 (典型值 0.01~0.03) */
     float          alpha;   /* 功率平滑因子 (典型值 0.9) */
     float          vad_thresh; /* 频点VAD能量比阈值 (β, 典型值 0.4~3.0) */
     float          leak;    /* 语音帧 W 泄漏因子 (0.999~1.0), 1.0=不泄漏 */
     float          smooth_factor; /* G_U 平滑因子(0.8~0.95)，越大G变化越慢 */
     int            complex_len; /* 频点数 */
     int            initialized; /* Pn 首帧已初始化标记 */
+    float          prev_fbf_energy; /* 前一帧 FBF 平滑能量，用于语音起振检测 */
+    int            onset_frames;    /* 剩余起振保护帧数（检测到起振后计数） */
+    float          onset_thresh;    /* 起振能量比阈值（默认 3.0） */
+
+    /* AMC 自适应模式控制器 */
+    float          amc_mu;      /* 当前帧有效 NLMS 步长（由 AMC 根据场景设定） */
+    float          W_max;       /* 权重幅值钳位上界 |W[k]| < W_max */
+    float          coh_smooth;  /* 帧级双麦相干系数平滑值 (0~1) */
 } TfGscContext;
 
 /**

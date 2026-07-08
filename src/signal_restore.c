@@ -9,15 +9,19 @@
 /*  Init                                                               */
 /* ------------------------------------------------------------------ */
 
-SignalRestoreContext* restore_init(int complex_len, float lambda, float eta, float beta)
+SignalRestoreContext* restore_init(int complex_len, float lambda, float eta, float eta_low,
+                                   float beta_low, float beta_high, float snr_thresh_db)
 {
     SignalRestoreContext *ctx = (SignalRestoreContext *)calloc(1, sizeof(SignalRestoreContext));
     if (!ctx) return NULL;
 
-    ctx->complex_len = complex_len;
-    ctx->lambda = lambda;
-    ctx->eta    = eta;
-    ctx->beta   = beta;
+    ctx->complex_len    = complex_len;
+    ctx->lambda         = lambda;
+    ctx->eta            = eta;
+    ctx->eta_low        = eta_low;
+    ctx->beta_low       = beta_low;
+    ctx->beta_high      = beta_high;
+    ctx->snr_thresh_db  = snr_thresh_db;
     /* initialized 由 calloc 置 0 */
 
     return ctx;
@@ -44,14 +48,6 @@ static float cos_sim(const fftwf_complex *X, const fftwf_complex *Y, int nbins)
     return (float)(dot / denom);
 }
 
-/* ---- sign function ---- */
-static inline float sgn(float x)
-{
-    if (x > 0.0f) return 1.0f;
-    if (x < 0.0f) return -1.0f;
-    return 0.0f;
-}
-
 /* ------------------------------------------------------------------ */
 /*  Process one frame                                                  */
 /* ------------------------------------------------------------------ */
@@ -76,7 +72,7 @@ void restore_process_frame(SignalRestoreContext *ctx,
     float c_x1u = cos_sim(X1, Y_U,   n);
     float c_x2u = cos_sim(X2, Y_U,   n);
 
-    /* 时间平滑 */
+    /* 时间平滑 (lambda=0.88~0.90) */
     if (!ctx->initialized) {
         ctx->S_X1_Y_FBF = c_x1f;
         ctx->S_X2_Y_FBF = c_x2f;
@@ -90,30 +86,35 @@ void restore_process_frame(SignalRestoreContext *ctx,
         ctx->S_X2_Y_U   = lam * ctx->S_X2_Y_U   + (1.0f - lam) * c_x2u;
     }
 
-    /* ---- Step 2: 决策差值 ---- */
-    float d12_fbf = ctx->S_X1_Y_FBF - ctx->S_X2_Y_FBF;   /* SD_X12_Y_FBF */
-    float d21_u   = ctx->S_X2_Y_U   - ctx->S_X1_Y_U;     /* SD_X21_Y_U   */
+    /* ---- Step 2: 帧级 SNR 计算 → 自适应 beta ---- */
+    double p_fbf_sum = 0.0, p_yu_sum = 0.0;
+    for (int k = 0; k < n; k++) {
+        p_fbf_sum += (double)(Y_FBF[k][0]*Y_FBF[k][0] + Y_FBF[k][1]*Y_FBF[k][1]);
+        p_yu_sum  += (double)(Y_U[k][0]*Y_U[k][0]   + Y_U[k][1]*Y_U[k][1]);
+    }
+    float snr_db = 10.0f * log10f((float)(p_fbf_sum + SR_EPSILON) / (float)(p_yu_sum + SR_EPSILON));
+    float beta = (snr_db > ctx->snr_thresh_db) ? ctx->beta_high : ctx->beta_low;
 
-    float eta = ctx->eta;
+    /* ---- Step 3: 三段式决策 ---- */
+    float d12_fbf = ctx->S_X1_Y_FBF - ctx->S_X2_Y_FBF;
+    float SD = fabsf(d12_fbf);
 
-    /* 选择: 0=不恢复, 1=X1, 2=X2, 3=(X1+X2)/2 */
     int sel = 0;
-
-    if (d12_fbf > eta && d21_u >= 0.0f) {
-        sel = 1;                            /* X1 */
-    } else if (d12_fbf <= -eta && d21_u <= 0.0f) {
-        sel = 2;                            /* X2 */
+    if (SD > ctx->eta) {
+        /* 相似度差值大 → 选匹配度高的单麦 */
+        sel = (d12_fbf > 0.0f) ? 1 : 2;
+    } else if (SD > ctx->eta_low) {
+        /* 中性区间 → 强制 (X1+X2)/2，绝不闭锁 */
+        sel = 3;
     } else {
-        float prod = d12_fbf * sgn(d21_u);
-        if (prod > 0.0f && prod <= eta) {
-            sel = 3;                        /* (X1+X2)/2 */
-        }
+        /* 强干扰 → 关闭补偿，仅保留 FBF */
+        sel = 0;
     }
 
-    /* ---- Step 3: 逐 bin 增益 + 恢复叠加 ---- */
+    /* ---- Step 4: 逐 bin 增益 + 恢复叠加 ---- */
     for (int k = 0; k < n; k++) {
         /* 选择 X_selected */
-        float re_xs, im_xs;
+        float re_xs = 0.0f, im_xs = 0.0f;
         switch (sel) {
         case 1:
             re_xs = X1[k][0]; im_xs = X1[k][1];
@@ -126,15 +127,14 @@ void restore_process_frame(SignalRestoreContext *ctx,
             im_xs = (X1[k][1] + X2[k][1]) * 0.5f;
             break;
         default: /* 不恢复 */
-            re_xs = 0.0f; im_xs = 0.0f;
             break;
         }
 
-        /* G_X = sqrt(|Y_FBF|² / (β·|Y_U|² + |Y_FBF|²)) */
+        /* G_X = sqrt(|Y_FBF|² / (β·|Y_U|² + |Y_FBF|² + ε)) */
         float p_fbf = Y_FBF[k][0]*Y_FBF[k][0] + Y_FBF[k][1]*Y_FBF[k][1];
         float p_yu  = Y_U[k][0]*Y_U[k][0]   + Y_U[k][1]*Y_U[k][1];
 
-        float gx = sqrtf(p_fbf / (ctx->beta * p_yu + p_fbf + SR_EPSILON));
+        float gx = sqrtf(p_fbf / (beta * p_yu + p_fbf + SR_EPSILON));
 
         /* Ȳ_FBF = Y_FBF + G_X · X_selected */
         Y_out[k][0] = Y_FBF[k][0] + gx * re_xs;
