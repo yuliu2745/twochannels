@@ -135,24 +135,44 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     if (nframes < 1) nframes = 1;
     uint32_t total_out = (nframes - 1) * hop + fft_size;
 
-    // 浮点累加缓冲 + 归一化权重累加
+    // 浮点累加缓冲 + 归一化权重累加 + VAD 权重累加
     float* out_float = (float*)calloc(total_out, sizeof(float));
     float* out_norm  = (float*)calloc(total_out, sizeof(float));
-    if (!out_float || !out_norm) {
-        free(out_float); free(out_norm);
+    float* out_vad   = (float*)calloc(total_out, sizeof(float));
+    if (!out_float || !out_norm || !out_vad) {
+        free(out_float); free(out_norm); free(out_vad);
         *outLen = 0; return NULL;
     }
 
+    // 自适应帧级 VAD 阈值跟踪
+    double max_frame_energy_db = -100.0;  // 对数域平滑最大值
+
     // 初始化 TF-GSC（频域自适应噪声对消）
-    // mu=0.01 控制自适应速度, alpha=0.92 功率平滑, beta=0.4 频点VAD门限
+    // mu=0.025 单语音 NLMS 步长, alpha=0.92 功率平滑, beta=0.4 频点VAD门限
     // leak=0.9995 语音帧缓慢衰减 W，减少人声泄漏抵消
     // smooth_factor=0.7 BM泄漏维纳增益平滑（快速跟踪）
-    TfGscContext* tf_gsc = tf_gsc_init(nbins, 0.01f, 0.92f, 0.4f, 0.9995f, 0.70f);
+    TfGscContext* tf_gsc = tf_gsc_init(nbins, 0.025f, 0.92f, 0.4f, 0.9995f, 0.70f);
     if (!tf_gsc) {
         free(out_float); free(out_norm);
         *outLen = 0;
         return NULL;
     }
+
+    // 配置 W 硬幅值钳位 ±0.15，防止权重过大吞噬人声
+    tf_gsc->W_max = 0.15f;
+
+    // 配置 BM 泄漏抑制：语音基频 80-800Hz G_U ≥ 0.9
+    tf_gsc->gU_low_bin  = (int)ceilf(80.0f / bin_hz);
+    tf_gsc->gU_high_bin = (int)floorf(800.0f / bin_hz);
+    tf_gsc->gU_min      = 0.9f;
+
+    // 模块 A: 时频扩散度掩膜 — 默认启用（统计量始终平滑，掩膜始终生效）
+    // 模块 B: FBF 前置直达语音增强 — 开启，从源头抬高直达人声基底
+    tf_gsc->gfb_enabled = 1;
+
+    // 模块 C: ANC 输出人声下限钳位 — 开启，保留最低 35% FBF 人声
+    tf_gsc->clamp_enabled   = 1;
+    tf_gsc->clamp_min_ratio = 0.35f;
 
     // 初始化后置 MMSE-LSA（降 TF-GSC 残留的不相关底噪）
     MmseLsaCtx lsa;
@@ -162,6 +182,20 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     // lambda=0.88 余弦相似度平滑, eta=0.10/0.03 三段式补偿,
     // beta_low=10(低SNR冻结), beta_high=5(高SNR适度增强), SNR门限=15dB
     SignalRestoreContext *restore = restore_init(nbins, 0.88f, 0.10f, 0.03f, 10.0f, 5.0f, 15.0f);
+
+    // ── MSC 时频掩膜状态（双麦幅度平方相干） ──
+    const float msc_alpha = 0.85f;                    // 功率谱时间平滑因子
+    float* msc_S11 = (float*)calloc(nbins, sizeof(float));  // 平滑 |X1|²
+    float* msc_S22 = (float*)calloc(nbins, sizeof(float));  // 平滑 |X2|²
+    float* msc_S12_re = (float*)calloc(nbins, sizeof(float)); // 平滑 Re(X1·X2*)
+    float* msc_S12_im = (float*)calloc(nbins, sizeof(float)); // 平滑 Im(X1·X2*)
+    float* msc_gain  = (float*)malloc(nbins * sizeof(float));
+    if (!msc_S11 || !msc_S22 || !msc_S12_re || !msc_S12_im || !msc_gain) {
+        free(msc_S11); free(msc_S22); free(msc_S12_re); free(msc_S12_im); free(msc_gain);
+        free(out_float); free(out_norm); free(out_vad);
+        *outLen = 0; return NULL;
+    }
+    for (int k = 0; k < nbins; k++) msc_gain[k] = 1.0f;  // 初始=1
 
     for (int f = 0; f < nframes; f++)
     {
@@ -214,26 +248,86 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
             }
         }
 
+        // ── MSC 双麦相干后滤波（抑制全向扩散噪声） ──
+        //  MSC = |E{X1·X2*}|² / (E{|X1|²}·E{|X2|²})
+        //  MSC>0.8→G=1, MSC<0.5→G=0.25(-12dB), 线性渐变
+        for (int k = 0; k < nbins; k++) {
+            float re_x1 = ctx->out1[k][0], im_x1 = ctx->out1[k][1];
+            float re_x2 = mic2_align[k][0], im_x2 = mic2_align[k][1];
+            float p1 = re_x1*re_x1 + im_x1*im_x1;
+            float p2 = re_x2*re_x2 + im_x2*im_x2;
+            float cr = re_x1*re_x2 + im_x1*im_x2;   // Re(X1·X2*)
+            float ci = im_x1*re_x2 - re_x1*im_x2;   // Im(X1·X2*)
+
+            msc_S11[k] = msc_alpha * msc_S11[k] + (1.0f - msc_alpha) * p1;
+            msc_S22[k] = msc_alpha * msc_S22[k] + (1.0f - msc_alpha) * p2;
+            msc_S12_re[k] = msc_alpha * msc_S12_re[k] + (1.0f - msc_alpha) * cr;
+            msc_S12_im[k] = msc_alpha * msc_S12_im[k] + (1.0f - msc_alpha) * ci;
+
+            float S11 = msc_S11[k], S22 = msc_S22[k];
+            float S12_mag2 = msc_S12_re[k]*msc_S12_re[k] + msc_S12_im[k]*msc_S12_im[k];
+            float denom = S11 * S22 + 1e-10f;
+            float msc = S12_mag2 / denom;
+            if (msc > 1.0f) msc = 1.0f;
+
+            // MSC→增益映射：0.5以下衰减12dB，0.8以上保留
+            float g_msc;
+            if (msc < 0.5f)
+                g_msc = 0.25f;
+            else if (msc < 0.8f)
+                g_msc = 0.25f + (msc - 0.5f) / 0.3f * 0.75f;
+            else
+                g_msc = 1.0f;
+
+            // 二阶平滑，防止音乐噪声（0.5递归平滑）
+            msc_gain[k] = 0.5f * msc_gain[k] + 0.5f * g_msc;
+            ctx->cs[k][0] *= msc_gain[k];
+            ctx->cs[k][1] *= msc_gain[k];
+        }
+
         // 后置 MMSE-LSA 降噪：消除 TF-GSC 无法处理的不相关底噪
         lsa_process_frame(&lsa, ctx->cs);
 
-        // 300~3400Hz 带通掩码（300~500Hz 直通，不再衰减）
-        for (int k = 0; k < nbins; k++) {
-            if (k < bin_low || k > bin_high) {
-                ctx->cs[k][0] = 0.0f;
-                ctx->cs[k][1] = 0.0f;
+        // ── 帧级 VAD 检测（基于 GSC 输出能量） ──
+        double frame_energy_db = -100.0;
+        {
+            double e = 0.0;
+            for (int k = 0; k < nbins; k++)
+                e += (double)(ctx->cs[k][0]*ctx->cs[k][0] + ctx->cs[k][1]*ctx->cs[k][1]);
+            e /= (double)nbins;
+            frame_energy_db = 10.0 * log10(e + 1e-30);
+        }
+
+        // 跟踪全局能量峰值，带 6dB/s 慢衰减（防止静音后误判）
+        if (frame_energy_db > max_frame_energy_db)
+            max_frame_energy_db = frame_energy_db;
+        else
+            max_frame_energy_db -= 0.15;  // 约 6dB/s @ 50fps
+
+        int vad_active = (frame_energy_db > max_frame_energy_db - 25.0) ? 1 : 0;
+
+        // VAD 门控带通掩膜：VAD=1 时压制带外噪声，VAD=0 时全通
+        if (vad_active) {
+            // 300~3400Hz 带通掩码（仅语音帧启用）
+            for (int k = 0; k < nbins; k++) {
+                if (k < bin_low || k > bin_high) {
+                    ctx->cs[k][0] = 0.0f;
+                    ctx->cs[k][1] = 0.0f;
+                }
             }
         }
 
         // IFFT
         fftwf_execute(ctx->plan_inv);
 
-        // 重叠相加：取 xcorr[0 : fft_size]（后半段是循环混叠）
+        // 重叠相加 + VAD 权重累积
         for (int i = 0; i < fft_size; i++) {
             int pos = start + i;
             if (pos < (int)total_out) {
                 out_float[pos] += ctx->xcorr[i];
                 out_norm[pos]  += ctx->window_coeffs[i % fft_size];
+                if (vad_active)
+                    out_vad[pos] += ctx->window_coeffs[i % fft_size];
             }
         }
     }
@@ -248,16 +342,21 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
 
     /* ========== 输出时域滤波器链 ========== */
 
-    // 1. 二阶 IIR 高通（Butterworth, fc=80Hz），消除 0-50Hz 帧处理低频泄漏
-    float w0 = 2.0f * (float)M_PI * 80.0f / (float)fs;
-    float alpha_hp = sinf(w0) * 0.70710678f;
-    float a0_hp = 1.0f + alpha_hp;
-    float hpf_b0 =  (1.0f + cosf(w0)) / (2.0f * a0_hp);
-    float hpf_b1 = -(1.0f + cosf(w0)) / a0_hp;
-    float hpf_b2 =  (1.0f + cosf(w0)) / (2.0f * a0_hp);
-    float hpf_a1 = -2.0f * cosf(w0) / a0_hp;
-    float hpf_a2 =  (1.0f - alpha_hp) / a0_hp;
-    float hp_x1 = 0.0f, hp_x2 = 0.0f, hp_y1 = 0.0f, hp_y2 = 0.0f;
+    // 1. 六阶 Butterworth 高通 fc=80Hz（3 级级联双二阶），提升低频衰减斜率
+    //    原二阶 @80Hz 仅 12dB/oct，六阶达 36dB/oct，有效压制 50~80Hz 共振
+    //    系数由模拟极点经双线性变换预计算，fs=16kHz
+    //    第1级 (σ=0.2588)
+    float hp1_b0 =  0.9917f, hp1_b1 = -1.9834f, hp1_b2 =  0.9917f;
+    float hp1_a1 = -1.9829f, hp1_a2 =  0.9839f;
+    float hp1_x1=0, hp1_x2=0, hp1_y1=0, hp1_y2=0;
+    //    第2级 (σ=0.7071)
+    float hp2_b0 =  0.9780f, hp2_b1 = -1.9561f, hp2_b2 =  0.9780f;
+    float hp2_a1 = -1.9556f, hp2_a2 =  0.9566f;
+    float hp2_x1=0, hp2_x2=0, hp2_y1=0, hp2_y2=0;
+    //    第3级 (σ=0.9659)
+    float hp3_b0 =  0.9703f, hp3_b1 = -1.9406f, hp3_b2 =  0.9703f;
+    float hp3_a1 = -1.9401f, hp3_a2 =  0.9411f;
+    float hp3_x1=0, hp3_x2=0, hp3_y1=0, hp3_y2=0;
 
     // 2. 自适应 50Hz 窄带陷波（Q=15），消除工频谐波
     float notch_Q = 15.0f;
@@ -302,14 +401,25 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
 
     for (uint32_t i = 0; i < total_out; i++) {
         float norm = (out_norm[i] > 1e-6f) ? out_norm[i] : 1.0f;
+        float vad_ratio = out_vad[i] / (norm + 1e-10f);
         float val = out_float[i] / ((float)input_len * norm);
 
-        // ① 80Hz 高通 —— 消除 0-50Hz 帧处理低频泄漏
-        float out_hp = hpf_b0*val + hpf_b1*hp_x1 + hpf_b2*hp_x2
-                     - hpf_a1*hp_y1 - hpf_a2*hp_y2;
-        hp_x2 = hp_x1; hp_x1 = val;
-        hp_y2 = hp_y1; hp_y1 = out_hp;
-        val = out_hp;
+        // ① 六阶高通 80Hz（3 级级联），压制 50~80Hz 共振
+        float out_hp1 = hp1_b0*val + hp1_b1*hp1_x1 + hp1_b2*hp1_x2
+                       - hp1_a1*hp1_y1 - hp1_a2*hp1_y2;
+        hp1_x2 = hp1_x1; hp1_x1 = val;
+        hp1_y2 = hp1_y1; hp1_y1 = out_hp1;
+
+        float out_hp2 = hp2_b0*out_hp1 + hp2_b1*hp2_x1 + hp2_b2*hp2_x2
+                       - hp2_a1*hp2_y1 - hp2_a2*hp2_y2;
+        hp2_x2 = hp2_x1; hp2_x1 = out_hp1;
+        hp2_y2 = hp2_y1; hp2_y1 = out_hp2;
+
+        float out_hp3 = hp3_b0*out_hp2 + hp3_b1*hp3_x1 + hp3_b2*hp3_x2
+                       - hp3_a1*hp3_y1 - hp3_a2*hp3_y2;
+        hp3_x2 = hp3_x1; hp3_x1 = out_hp2;
+        hp3_y2 = hp3_y1; hp3_y1 = out_hp3;
+        val = out_hp3;
 
         // ② 50Hz 窄带陷波 —— 消除工频基波
         float out_n50 = n50_b0*val + n50_b1*n50_x1 + n50_b2*n50_x2
@@ -325,12 +435,15 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         n100_y2 = n100_y1; n100_y1 = out_n100;
         val = out_n100;
 
-        // ④ 1.2kHz 高频搁架 +6dB —— 还原齿音/清辅音清晰度
-        float out_hs = hs_b0n*val + hs_b1n*hs_x1 + hs_b2n*hs_x2
-                     - hs_a1n*hs_y1 - hs_a2n*hs_y2;
-        hs_x2 = hs_x1; hs_x1 = val;
-        hs_y2 = hs_y1; hs_y1 = out_hs;
-        val = out_hs;
+        // ④ 1.2kHz 高频搁架 +6dB —— VAD 门控：仅语音段提升齿音
+        if (vad_ratio > 0.1f) {
+            float out_hs = hs_b0n*val + hs_b1n*hs_x1 + hs_b2n*hs_x2
+                         - hs_a1n*hs_y1 - hs_a2n*hs_y2;
+            hs_x2 = hs_x1; hs_x1 = val;
+            hs_y2 = hs_y1; hs_y1 = out_hs;
+            val = out_hs;
+        }
+        // 静音段：旁路高搁架，不更新 IIR 状态，不放大高频底噪
 
         // 幅度恢复 + 钳位
         val *= 1.5f;
@@ -338,6 +451,10 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         if (val < -32768.0f) val = -32768.0f;
         out[i] = (int16_t)val;
     }
+
+    free(msc_S11); free(msc_S22); free(msc_S12_re); free(msc_S12_im); free(msc_gain);
+
+    free(out_vad);
 
     free(out_float);
     free(out_norm);
