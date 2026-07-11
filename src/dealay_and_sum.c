@@ -122,10 +122,12 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     int nbins     = ctx->complex_len;   // fft_size + 1
     int hop       = fft_size / 2;       // 50% 重叠
 
-    // 人声带通边界 + 过渡段
+    // 前置滚降带通边界 250~3400Hz（过渡带宽 ~50Hz/~200Hz）
     float bin_hz = (float)fs / (float)input_len;
-    int bin_low  = (int)ceilf(300.0f / bin_hz);
-    int bin_high = (int)floorf(3400.0f / bin_hz);
+    int pre_bin_low  = (int)ceilf(250.0f / bin_hz);
+    int pre_bin_high = (int)floorf(3400.0f / bin_hz);
+    int pre_trans_low  = (int)ceilf(50.0f / bin_hz);    // ~6 bins @16kHz，<200硬清零→250渐升
+    int pre_trans_high = (int)ceilf(200.0f / bin_hz);    // ~25 bins @16kHz
 
     uint32_t min_len = (len1 < len2) ? len1 : len2;
     if (min_len == 0) { *outLen = 0; return NULL; }
@@ -135,23 +137,19 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     if (nframes < 1) nframes = 1;
     uint32_t total_out = (nframes - 1) * hop + fft_size;
 
-    // 浮点累加缓冲 + 归一化权重累加 + VAD 权重累加
+    // 浮点累加缓冲 + 归一化权重累加
     float* out_float = (float*)calloc(total_out, sizeof(float));
     float* out_norm  = (float*)calloc(total_out, sizeof(float));
-    float* out_vad   = (float*)calloc(total_out, sizeof(float));
-    if (!out_float || !out_norm || !out_vad) {
-        free(out_float); free(out_norm); free(out_vad);
+    if (!out_float || !out_norm) {
+        free(out_float); free(out_norm);
         *outLen = 0; return NULL;
     }
 
-    // 自适应帧级 VAD 阈值跟踪
-    double max_frame_energy_db = -100.0;  // 对数域平滑最大值
-
     // 初始化 TF-GSC（频域自适应噪声对消）
-    // mu=0.025 单语音 NLMS 步长, alpha=0.92 功率平滑, beta=0.4 频点VAD门限
-    // leak=0.9995 语音帧缓慢衰减 W，减少人声泄漏抵消
-    // smooth_factor=0.7 BM泄漏维纳增益平滑（快速跟踪）
-    TfGscContext* tf_gsc = tf_gsc_init(nbins, 0.025f, 0.92f, 0.4f, 0.9995f, 0.70f);
+    // mu=0.04 单语音 NLMS 步长, alpha=0.92 功率平滑, beta=1.2 频点VAD门限
+    // leak=0.9900 语音帧缓慢衰减 W，减少人声泄漏抵消
+    // smooth_factor=0.85 BM泄漏维纳增益平滑（快速跟踪）
+    TfGscContext* tf_gsc = tf_gsc_init(nbins, 0.04f, 0.92f, 1.0f, 0.9800f, 0.85f);
     if (!tf_gsc) {
         free(out_float); free(out_norm);
         *outLen = 0;
@@ -177,6 +175,9 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     // 初始化后置 MMSE-LSA（降 TF-GSC 残留的不相关底噪）
     MmseLsaCtx lsa;
     lsa_init(&lsa, nbins);
+    // 子带门控高频搁架渐变：900→1200Hz 线性从 1.0→2.0，≥1200Hz 恒 2.0
+    lsa.hs_bin_ramp_start = (int)floorf(900.0f / bin_hz);
+    lsa.hs_bin_full       = (int)floorf(1200.0f / bin_hz);
 
     // 初始化信号恢复模块（补偿波束成形对期望语音的损伤）
     // lambda=0.88 余弦相似度平滑, eta=0.10/0.03 三段式补偿,
@@ -192,7 +193,7 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     float* msc_gain  = (float*)malloc(nbins * sizeof(float));
     if (!msc_S11 || !msc_S22 || !msc_S12_re || !msc_S12_im || !msc_gain) {
         free(msc_S11); free(msc_S22); free(msc_S12_re); free(msc_S12_im); free(msc_gain);
-        free(out_float); free(out_norm); free(out_vad);
+        free(out_float); free(out_norm);
         *outLen = 0; return NULL;
     }
     for (int k = 0; k < nbins; k++) msc_gain[k] = 1.0f;  // 初始=1
@@ -218,6 +219,37 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         // FFT
         fftwf_execute(ctx->plan_fwd1);
         fftwf_execute(ctx->plan_fwd2);
+
+        // 前置滚降带通 250~3400Hz（原始麦克频谱，永久生效，不分VAD）
+        //   低频段：<200Hz 硬清零，200~250Hz 线性渐升 0→1
+        //   高频过渡带 3400~3600Hz：线性渐变从 1→0
+        int low_start = pre_bin_low - pre_trans_low;
+        if (low_start < 0) low_start = 0;
+        for (int k = 0; k < nbins; k++) {
+            float gain = 1.0f;
+            if (k < pre_bin_low) {
+                if (k < low_start) {
+                    gain = 0.0f;
+                } else {
+                    float dist = (float)(k - low_start) / (float)(pre_trans_low);
+                    if (dist > 1.0f) dist = 1.0f;
+                    gain = dist;
+                }
+            } else if (k > pre_bin_high) {
+                int end = pre_bin_high + pre_trans_high;
+                if (end > nbins) end = nbins;
+                if (k < end) {
+                    float dist = 1.0f - (float)(k - pre_bin_high) / (float)(pre_trans_high);
+                    if (dist < 0.0f) dist = 0.0f;
+                    if (dist > 1.0f) dist = 1.0f;
+                    gain = dist;
+                } else {
+                    gain = 0.0f;
+                }
+            }
+            ctx->out1[k][0] *= gain; ctx->out1[k][1] *= gain;
+            ctx->out2[k][0] *= gain; ctx->out2[k][1] *= gain;
+        }
 
         // 相位旋转补偿亚采样延迟（复制 mic2 频谱用于旋转）
         fftwf_complex mic2_align[nbins];
@@ -288,46 +320,15 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         // 后置 MMSE-LSA 降噪：消除 TF-GSC 无法处理的不相关底噪
         lsa_process_frame(&lsa, ctx->cs);
 
-        // ── 帧级 VAD 检测（基于 GSC 输出能量） ──
-        double frame_energy_db = -100.0;
-        {
-            double e = 0.0;
-            for (int k = 0; k < nbins; k++)
-                e += (double)(ctx->cs[k][0]*ctx->cs[k][0] + ctx->cs[k][1]*ctx->cs[k][1]);
-            e /= (double)nbins;
-            frame_energy_db = 10.0 * log10(e + 1e-30);
-        }
-
-        // 跟踪全局能量峰值，带 6dB/s 慢衰减（防止静音后误判）
-        if (frame_energy_db > max_frame_energy_db)
-            max_frame_energy_db = frame_energy_db;
-        else
-            max_frame_energy_db -= 0.15;  // 约 6dB/s @ 50fps
-
-        int vad_active = (frame_energy_db > max_frame_energy_db - 25.0) ? 1 : 0;
-
-        // VAD 门控带通掩膜：VAD=1 时压制带外噪声，VAD=0 时全通
-        if (vad_active) {
-            // 300~3400Hz 带通掩码（仅语音帧启用）
-            for (int k = 0; k < nbins; k++) {
-                if (k < bin_low || k > bin_high) {
-                    ctx->cs[k][0] = 0.0f;
-                    ctx->cs[k][1] = 0.0f;
-                }
-            }
-        }
-
         // IFFT
         fftwf_execute(ctx->plan_inv);
 
-        // 重叠相加 + VAD 权重累积
+        // 重叠相加
         for (int i = 0; i < fft_size; i++) {
             int pos = start + i;
             if (pos < (int)total_out) {
                 out_float[pos] += ctx->xcorr[i];
                 out_norm[pos]  += ctx->window_coeffs[i % fft_size];
-                if (vad_active)
-                    out_vad[pos] += ctx->window_coeffs[i % fft_size];
             }
         }
     }
@@ -381,27 +382,9 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     float n100_a2 = (1.0f - alpha_100) / a0_100;
     float n100_x1 = 0.0f, n100_x2 = 0.0f, n100_y1 = 0.0f, n100_y2 = 0.0f;
 
-    // 4. 高频搁架（High-shelf, fc=1.2kHz, +6dB），还原齿音/辅音清晰度
-    float hs_gain_db = 6.0f;
-    float A_hs = powf(10.0f, hs_gain_db / 40.0f);  /* A = 10^(dB/40) */
-    float w0_hs = 2.0f * (float)M_PI * 1200.0f / (float)fs;
-    float alpha_hs = sinf(w0_hs) * 0.70710678f;    /* S=1 → alpha = sin(w0)/√2 */
-    float cos_hs = cosf(w0_hs);
-    float sqrtA = sqrtf(A_hs);
-    float hs_b0 = A_hs * ((A_hs+1.0f) + (A_hs-1.0f)*cos_hs + 2.0f*sqrtA*alpha_hs);
-    float hs_b1 = -2.0f*A_hs * ((A_hs-1.0f) + (A_hs+1.0f)*cos_hs);
-    float hs_b2 = A_hs * ((A_hs+1.0f) + (A_hs-1.0f)*cos_hs - 2.0f*sqrtA*alpha_hs);
-    float hs_a0 = (A_hs+1.0f) - (A_hs-1.0f)*cos_hs + 2.0f*sqrtA*alpha_hs;
-    float hs_a1 = 2.0f * ((A_hs-1.0f) - (A_hs+1.0f)*cos_hs);
-    float hs_a2 = (A_hs+1.0f) - (A_hs-1.0f)*cos_hs - 2.0f*sqrtA*alpha_hs;
-    /* 归一化到 a0 */
-    float hs_b0n = hs_b0 / hs_a0, hs_b1n = hs_b1 / hs_a0, hs_b2n = hs_b2 / hs_a0;
-    float hs_a1n = hs_a1 / hs_a0, hs_a2n = hs_a2 / hs_a0;
-    float hs_x1 = 0.0f, hs_x2 = 0.0f, hs_y1 = 0.0f, hs_y2 = 0.0f;
-
+    // 4. (removed: 高频搁架移至频域 LSA 子带门控实现)
     for (uint32_t i = 0; i < total_out; i++) {
         float norm = (out_norm[i] > 1e-6f) ? out_norm[i] : 1.0f;
-        float vad_ratio = out_vad[i] / (norm + 1e-10f);
         float val = out_float[i] / ((float)input_len * norm);
 
         // ① 六阶高通 80Hz（3 级级联），压制 50~80Hz 共振
@@ -435,26 +418,14 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         n100_y2 = n100_y1; n100_y1 = out_n100;
         val = out_n100;
 
-        // ④ 1.2kHz 高频搁架 +6dB —— VAD 门控：仅语音段提升齿音
-        if (vad_ratio > 0.1f) {
-            float out_hs = hs_b0n*val + hs_b1n*hs_x1 + hs_b2n*hs_x2
-                         - hs_a1n*hs_y1 - hs_a2n*hs_y2;
-            hs_x2 = hs_x1; hs_x1 = val;
-            hs_y2 = hs_y1; hs_y1 = out_hs;
-            val = out_hs;
-        }
-        // 静音段：旁路高搁架，不更新 IIR 状态，不放大高频底噪
-
-        // 幅度恢复 + 钳位
-        val *= 1.5f;
-        if (val >  32767.0f) val =  32767.0f;
-        if (val < -32768.0f) val = -32768.0f;
+        // 幅度恢复 + 软限幅
+        val *= 1.25f;
+        if (val >  30000.0f) val =  30000.0f;
+        if (val < -30000.0f) val = -30000.0f;
         out[i] = (int16_t)val;
     }
 
     free(msc_S11); free(msc_S22); free(msc_S12_re); free(msc_S12_im); free(msc_gain);
-
-    free(out_vad);
 
     free(out_float);
     free(out_norm);
