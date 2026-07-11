@@ -10,7 +10,8 @@
 /* ------------------------------------------------------------------ */
 
 SignalRestoreContext* restore_init(int complex_len, float lambda, float eta, float eta_low,
-                                   float beta_low, float beta_high, float snr_thresh_db)
+                                   float beta_low, float beta_high, float snr_thresh_db,
+                                   int sample_rate)
 {
     SignalRestoreContext *ctx = (SignalRestoreContext *)calloc(1, sizeof(SignalRestoreContext));
     if (!ctx) return NULL;
@@ -22,6 +23,9 @@ SignalRestoreContext* restore_init(int complex_len, float lambda, float eta, flo
     ctx->beta_low       = beta_low;
     ctx->beta_high      = beta_high;
     ctx->snr_thresh_db  = snr_thresh_db;
+    ctx->sample_rate    = sample_rate;
+    /* bin_hz = fs / (2 * fft_size), 其中 complex_len = fft_size + 1 */
+    ctx->bin_hz         = (float)sample_rate / (2.0f * (complex_len - 1));
     /* initialized 由 calloc 置 0 */
 
     return ctx;
@@ -135,6 +139,20 @@ void restore_process_frame(SignalRestoreContext *ctx,
         float p_yu  = Y_U[k][0]*Y_U[k][0]   + Y_U[k][1]*Y_U[k][1];
 
         float gx = sqrtf(p_fbf / (beta * p_yu + p_fbf + SR_EPSILON));
+
+        /* ---- 子带级 SNR 硬阻断：γ[k] < 1.3 → 禁止注入 X_selected ---- */
+        float gamma_k = p_fbf / (p_yu + SR_EPSILON);
+        if (gamma_k < 1.3f) {
+            gx = 0.0f;
+        } else {
+            /* γ[k] ≥ 1.3：仅弱语音区(<2.0)施加低频保护，强语音保留原值 */
+            if (gamma_k < 2.0f) {
+                float freq_k = (float)k * ctx->bin_hz;
+                if (freq_k < 1000.0f) {
+                    gx *= 0.15f;
+                }
+            }
+        }
 
         /* Ȳ_FBF = Y_FBF + G_X · X_selected */
         Y_out[k][0] = Y_FBF[k][0] + gx * re_xs;

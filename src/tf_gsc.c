@@ -49,6 +49,7 @@ TfGscContext* tf_gsc_init(int complex_len, float mu, float alpha, float vad_thre
     tf_gsc->W = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * complex_len);
     tf_gsc->Pn = (float *)fftwf_malloc(sizeof(float) * complex_len);
     tf_gsc->G_smooth = (float *)fftwf_malloc(sizeof(float) * complex_len);
+    tf_gsc->Pn_bm = (float *)fftwf_malloc(sizeof(float) * complex_len);
     tf_gsc->S_floor = (float *)fftwf_malloc(sizeof(float) * complex_len);
 
     /* 模块 A: 扩散度掩膜阵列 */
@@ -57,7 +58,7 @@ TfGscContext* tf_gsc_init(int complex_len, float mu, float alpha, float vad_thre
     tf_gsc->diff_C12_re = (float *)fftwf_malloc(sizeof(float) * complex_len);
     tf_gsc->diff_C12_im = (float *)fftwf_malloc(sizeof(float) * complex_len);
 
-    if (!tf_gsc->W || !tf_gsc->Pn || !tf_gsc->G_smooth || !tf_gsc->S_floor
+    if (!tf_gsc->W || !tf_gsc->Pn || !tf_gsc->G_smooth || !tf_gsc->Pn_bm || !tf_gsc->S_floor
         || !tf_gsc->diff_P1 || !tf_gsc->diff_P2 || !tf_gsc->diff_C12_re || !tf_gsc->diff_C12_im) {
         tf_gsc_destroy(tf_gsc);
         return NULL;
@@ -67,6 +68,7 @@ TfGscContext* tf_gsc_init(int complex_len, float mu, float alpha, float vad_thre
     memset(tf_gsc->W,  0, sizeof(fftwf_complex) * complex_len);
     memset(tf_gsc->Pn, 0, sizeof(float)          * complex_len);
     memset(tf_gsc->G_smooth, 0, sizeof(float)    * complex_len);
+    memset(tf_gsc->Pn_bm,    0, sizeof(float)    * complex_len);
     memset(tf_gsc->S_floor, 0, sizeof(float)     * complex_len);
     memset(tf_gsc->diff_P1, 0, sizeof(float)     * complex_len);
     memset(tf_gsc->diff_P2, 0, sizeof(float)     * complex_len);
@@ -84,6 +86,7 @@ TfGscContext* tf_gsc_init(int complex_len, float mu, float alpha, float vad_thre
     /* AMC 默认值 */
     tf_gsc->amc_mu         = mu;     /* 初始 = 基准步长 */
     tf_gsc->W_max          = 0.15f;  /* 权重幅值钳位 ±0.15，限制抵消强度 */
+    tf_gsc->W_min          = 0.0f;   /* 权重幅值下界 0.0=禁用，由上层按需配置 */
     tf_gsc->coh_smooth     = 0.0f;
 
     /* BM 泄漏保护默认：未配置时不生效 */
@@ -94,7 +97,7 @@ TfGscContext* tf_gsc_init(int complex_len, float mu, float alpha, float vad_thre
     /* 模块 A: 扩散度掩膜默认 */
     tf_gsc->diff_alpha    = 0.85f;
     tf_gsc->diff_thresh   = 0.6f;
-    tf_gsc->diff_suppress = 0.4f;
+    tf_gsc->diff_suppress = 0.25f;
 
     /* 模块 B: FBF 前置增强默认关闭 */
     tf_gsc->gfb_enabled = 0;
@@ -128,7 +131,6 @@ void tf_gsc_process_frame(TfGscContext *tf_gsc,
     float mu    = tf_gsc->mu;
     float alpha = tf_gsc->alpha;
     float beta  = tf_gsc->vad_thresh;
-    float leak  = tf_gsc->leak;
     float sf    = tf_gsc->smooth_factor;
 
     /* ============================================================ */
@@ -170,6 +172,17 @@ void tf_gsc_process_frame(TfGscContext *tf_gsc,
         tf_gsc->diff_C12_im[k] = da * tf_gsc->diff_C12_im[k] + (1.0f - da) * ci;
     }
 
+    /* ---- 帧级 γ_avg = Σ|S|² / Σ|N|²，用于分级泄漏与 ANC 钳位门控 ---- */
+    float frame_gamma = fbf_energy / (bm_energy + 1e-10f);
+    float frame_leak;
+    if (frame_gamma > 1.5f) {
+        frame_leak = 0.995f;       /* 强语音：几乎不衰减，保收敛精度 */
+    } else if (frame_gamma > 1.0f) {
+        frame_leak = 0.99f;        /* 弱语音：轻微泄放，防过拟合 */
+    } else {
+        frame_leak = 0.98f;        /* 静音：缓慢泄放 W → 纯 FBF 输出 */
+    }
+
     /* ---- 起振检测（延续现有 onset 逻辑） ---- */
     if (tf_gsc->initialized) {
         fbf_energy /= (float)n;
@@ -197,12 +210,13 @@ void tf_gsc_process_frame(TfGscContext *tf_gsc,
         if (spatial_snr_db < 6.0f && coh > 0.85f) {
             /* 纯静音 / 扩散噪声场 → 完全冻结 NLMS */
             effective_mu = 0.0f;
-        } else if (spatial_snr_db > 12.0f) {
-            /* 强单目标语音 → 正常步长 */
-            effective_mu = mu;          /* 0.025 */
+        } else if (spatial_snr_db < 6.0f) {
+            effective_mu = 0.002f;      /* 低 SNR 非纯静音，较小步长 */
+        } else if (spatial_snr_db < 12.0f) {
+            float t = (spatial_snr_db - 6.0f) / 6.0f;
+            effective_mu = mu * t;      /* 6~12dB 线性渐升至 μ */
         } else {
-            /* 弱语音 / 混响 / 多声源 → 超小步长，W 基本停滞 */
-            effective_mu = 0.005f;      /* 慢速更新，防止发散 */
+            effective_mu = mu;          /* >12dB 全速更新 */
         }
     }
 
@@ -269,7 +283,11 @@ void tf_gsc_process_frame(TfGscContext *tf_gsc,
 
         float speech_energy = pow_s - s_floor;
         if (speech_energy < 0.0f) speech_energy = 0.0f;
-        float G_U = raw_pow_n / (speech_energy + raw_pow_n + TF_GSC_EPSILON);
+
+        /* BM 噪声功率帧间平滑，稳定维纳增益 */
+        tf_gsc->Pn_bm[k] = 0.85f * tf_gsc->Pn_bm[k] + 0.15f * raw_pow_n;
+        float smooth_pow_n = tf_gsc->Pn_bm[k];
+        float G_U = smooth_pow_n / (speech_energy + smooth_pow_n + TF_GSC_EPSILON);
 
         tf_gsc->G_smooth[k] = sf * tf_gsc->G_smooth[k] + (1.0f - sf) * G_U;
         float g = tf_gsc->G_smooth[k];
@@ -332,8 +350,8 @@ void tf_gsc_process_frame(TfGscContext *tf_gsc,
         float re_y = re_s - re_wn;
         float im_y = im_s - im_wn;
 
-        /* 模块 C: ANC 输出人声下限钳位 — VAD 门控，最后一道防线 */
-        if (tf_gsc->clamp_enabled && tf_gsc->clamp_vad) {
+        /* 模块 C: ANC 输出人声下限钳位 — VAD 门控 + 静音帧放开 */
+        if (tf_gsc->clamp_enabled && tf_gsc->clamp_vad && frame_gamma > 1.0f) {
             float mag_y = sqrtf(re_y*re_y + im_y*im_y);
             float mag_s = sqrtf(re_s*re_s + im_s*im_s);
             float min_mag = tf_gsc->clamp_min_ratio * mag_s;
@@ -351,9 +369,11 @@ void tf_gsc_process_frame(TfGscContext *tf_gsc,
             tf_gsc->Pn[k] = alpha * tf_gsc->Pn[k] + (1.0f - alpha) * cleaned_pow_n;
 
             if (effective_mu > 0.0f) {
-                /* AMC 允许更新 → 使用有效步长 */
+                /* 统一 NLMS 步长（不分段），噪声快速收敛，防止 pd_n 持续抬升 */
+                float bin_mu = effective_mu;
+
                 float denom = tf_gsc->Pn[k] + TF_GSC_EPSILON;
-                float scale = effective_mu / denom;
+                float scale = bin_mu / denom;
 
                 float re_dw = (re_n * re_y + im_n * im_y) * scale;
                 float im_dw = (re_n * im_y - im_n * re_y) * scale;
@@ -361,19 +381,20 @@ void tf_gsc_process_frame(TfGscContext *tf_gsc,
                 tf_gsc->W[k][0] += re_dw;
                 tf_gsc->W[k][1] += im_dw;
             } else {
-                /* μ=0：完全冻结 W，仅 leak 防止噪作漂移 */
-                tf_gsc->W[k][0] *= leak;
-                tf_gsc->W[k][1] *= leak;
+                /* μ=0：完全冻结 W，仅分级 leak 泄放权重 */
+                tf_gsc->W[k][0] *= frame_leak;
+                tf_gsc->W[k][1] *= frame_leak;
             }
         }
         else
         {
             if (in_onset) {
-                tf_gsc->W[k][0] *= 0.85f;
-                tf_gsc->W[k][1] *= 0.85f;
+                /* 每帧 ×0.975，8 帧累计 ≈ ×0.817，从 W 末态平滑过渡无跳变 */
+                tf_gsc->W[k][0] *= 0.975f;
+                tf_gsc->W[k][1] *= 0.975f;
             } else {
-                tf_gsc->W[k][0] *= leak;
-                tf_gsc->W[k][1] *= leak;
+                tf_gsc->W[k][0] *= frame_leak;
+                tf_gsc->W[k][1] *= frame_leak;
             }
         }
 
@@ -389,6 +410,20 @@ void tf_gsc_process_frame(TfGscContext *tf_gsc,
             float scale = tf_gsc->W_max / sqrtf(mag_sq);
             tf_gsc->W[k][0] *= scale;
             tf_gsc->W[k][1] *= scale;
+        }
+    }
+
+    /* ---- 权重幅值钳位下界：|W[k]| ≥ W_min，防止过度衰减弱语音 ---- */
+    float W_min_val = tf_gsc->W_min;
+    if (W_min_val > 0.0f) {
+        float W_min_sq = W_min_val * W_min_val;
+        for (int k = 0; k < n; k++) {
+            float mag_sq = tf_gsc->W[k][0]*tf_gsc->W[k][0] + tf_gsc->W[k][1]*tf_gsc->W[k][1];
+            if (mag_sq < W_min_sq) {
+                float scale = W_min_val / (sqrtf(mag_sq) + TF_GSC_EPSILON);
+                tf_gsc->W[k][0] *= scale;
+                tf_gsc->W[k][1] *= scale;
+            }
         }
     }
 
@@ -408,6 +443,7 @@ void tf_gsc_destroy(TfGscContext *tf_gsc)
     if (tf_gsc->W)        fftwf_free(tf_gsc->W);
     if (tf_gsc->Pn)       fftwf_free(tf_gsc->Pn);
     if (tf_gsc->G_smooth) fftwf_free(tf_gsc->G_smooth);
+    if (tf_gsc->Pn_bm)    fftwf_free(tf_gsc->Pn_bm);
     if (tf_gsc->S_floor)  fftwf_free(tf_gsc->S_floor);
     if (tf_gsc->diff_P1)     fftwf_free(tf_gsc->diff_P1);
     if (tf_gsc->diff_P2)     fftwf_free(tf_gsc->diff_P2);

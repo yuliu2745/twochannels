@@ -21,6 +21,7 @@ typedef struct {
     fftwf_complex *W;       /* 复数自适应权重 (complex_len) */
     float         *Pn;      /* 噪声参考平滑功率 (complex_len) */
     float         *G_smooth; /* 逐频点维纳增益(平滑后)，用于BM泄漏抑制 */
+    float         *Pn_bm;    /* BM 噪声功率帧间平滑 (complex_len) */
     float         *S_floor;  /* 语音参考功率噪声底 (complex_len)，缓慢跟踪最小值 */
     float          mu;      /* NLMS 基准步长 (典型值 0.01~0.03) */
     float          alpha;   /* 功率平滑因子 (典型值 0.9) */
@@ -36,6 +37,7 @@ typedef struct {
     /* AMC 自适应模式控制器 */
     float          amc_mu;      /* 当前帧有效 NLMS 步长（由 AMC 根据场景设定） */
     float          W_max;       /* 权重幅值钳位上界 |W[k]| < W_max (推荐 0.12~0.18) */
+    float          W_min;       /* 权重幅值钳位下界 |W[k]| ≥ W_min (推荐 0.2), 防过度衰减 */
     float          coh_smooth;  /* 帧级双麦相干系数平滑值 (0~1) */
 
     /* BM 泄漏抑制：语音基频段增益保护 */

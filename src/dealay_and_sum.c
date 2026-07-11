@@ -124,10 +124,6 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
 
     // 前置滚降带通边界 250~3400Hz（过渡带宽 ~50Hz/~200Hz）
     float bin_hz = (float)fs / (float)input_len;
-    int pre_bin_low  = (int)ceilf(250.0f / bin_hz);
-    int pre_bin_high = (int)floorf(3400.0f / bin_hz);
-    int pre_trans_low  = (int)ceilf(50.0f / bin_hz);    // ~6 bins @16kHz，<200硬清零→250渐升
-    int pre_trans_high = (int)ceilf(200.0f / bin_hz);    // ~25 bins @16kHz
 
     uint32_t min_len = (len1 < len2) ? len1 : len2;
     if (min_len == 0) { *outLen = 0; return NULL; }
@@ -146,7 +142,7 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     }
 
     // 初始化 TF-GSC（频域自适应噪声对消）
-    // mu=0.04 单语音 NLMS 步长, alpha=0.92 功率平滑, beta=1.2 频点VAD门限
+    // mu=0.04 单语音 NLMS 步长, alpha=0.92 功率平滑, beta=1.0 频点VAD门限
     // leak=0.9900 语音帧缓慢衰减 W，减少人声泄漏抵消
     // smooth_factor=0.85 BM泄漏维纳增益平滑（快速跟踪）
     TfGscContext* tf_gsc = tf_gsc_init(nbins, 0.04f, 0.92f, 1.0f, 0.9800f, 0.85f);
@@ -156,8 +152,9 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         return NULL;
     }
 
-    // 配置 W 硬幅值钳位 ±0.15，防止权重过大吞噬人声
+    // 配置 W 硬幅值钳位 ±0.15，防止权重过大吞噬人声；下限 0.2 防止过度衰减
     tf_gsc->W_max = 0.15f;
+    // W_min 保持 0.0（禁用），让自适应滤波器原生收敛
 
     // 配置 BM 泄漏抑制：语音基频 80-800Hz G_U ≥ 0.9
     tf_gsc->gU_low_bin  = (int)ceilf(80.0f / bin_hz);
@@ -175,28 +172,16 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
     // 初始化后置 MMSE-LSA（降 TF-GSC 残留的不相关底噪）
     MmseLsaCtx lsa;
     lsa_init(&lsa, nbins);
-    // 子带门控高频搁架渐变：900→1200Hz 线性从 1.0→2.0，≥1200Hz 恒 2.0
-    lsa.hs_bin_ramp_start = (int)floorf(900.0f / bin_hz);
-    lsa.hs_bin_full       = (int)floorf(1200.0f / bin_hz);
+    // 高频搁架三段平滑过渡：正弦平方 500→1000Hz 1.0→1.8，线性 1000→2500Hz 1.8→2.2，正弦平方降 2500→3400Hz 2.2→1.0
+    lsa.hs_bin_500  = (int)floorf(500.0f / bin_hz);
+    lsa.hs_bin_1000 = (int)floorf(1000.0f / bin_hz);
+    lsa.hs_bin_2500 = (int)floorf(2500.0f / bin_hz);
+    lsa.hs_bin_3400 = (int)floorf(3400.0f / bin_hz);
 
     // 初始化信号恢复模块（补偿波束成形对期望语音的损伤）
     // lambda=0.88 余弦相似度平滑, eta=0.10/0.03 三段式补偿,
     // beta_low=10(低SNR冻结), beta_high=5(高SNR适度增强), SNR门限=15dB
-    SignalRestoreContext *restore = restore_init(nbins, 0.88f, 0.10f, 0.03f, 10.0f, 5.0f, 15.0f);
-
-    // ── MSC 时频掩膜状态（双麦幅度平方相干） ──
-    const float msc_alpha = 0.85f;                    // 功率谱时间平滑因子
-    float* msc_S11 = (float*)calloc(nbins, sizeof(float));  // 平滑 |X1|²
-    float* msc_S22 = (float*)calloc(nbins, sizeof(float));  // 平滑 |X2|²
-    float* msc_S12_re = (float*)calloc(nbins, sizeof(float)); // 平滑 Re(X1·X2*)
-    float* msc_S12_im = (float*)calloc(nbins, sizeof(float)); // 平滑 Im(X1·X2*)
-    float* msc_gain  = (float*)malloc(nbins * sizeof(float));
-    if (!msc_S11 || !msc_S22 || !msc_S12_re || !msc_S12_im || !msc_gain) {
-        free(msc_S11); free(msc_S22); free(msc_S12_re); free(msc_S12_im); free(msc_gain);
-        free(out_float); free(out_norm);
-        *outLen = 0; return NULL;
-    }
-    for (int k = 0; k < nbins; k++) msc_gain[k] = 1.0f;  // 初始=1
+    SignalRestoreContext *restore = restore_init(nbins, 0.88f, 0.10f, 0.03f, 10.0f, 5.0f, 15.0f, fs);
 
     for (int f = 0; f < nframes; f++)
     {
@@ -220,43 +205,14 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         fftwf_execute(ctx->plan_fwd1);
         fftwf_execute(ctx->plan_fwd2);
 
-        // 前置滚降带通 250~3400Hz（原始麦克频谱，永久生效，不分VAD）
-        //   低频段：<200Hz 硬清零，200~250Hz 线性渐升 0→1
-        //   高频过渡带 3400~3600Hz：线性渐变从 1→0
-        int low_start = pre_bin_low - pre_trans_low;
-        if (low_start < 0) low_start = 0;
-        for (int k = 0; k < nbins; k++) {
-            float gain = 1.0f;
-            if (k < pre_bin_low) {
-                if (k < low_start) {
-                    gain = 0.0f;
-                } else {
-                    float dist = (float)(k - low_start) / (float)(pre_trans_low);
-                    if (dist > 1.0f) dist = 1.0f;
-                    gain = dist;
-                }
-            } else if (k > pre_bin_high) {
-                int end = pre_bin_high + pre_trans_high;
-                if (end > nbins) end = nbins;
-                if (k < end) {
-                    float dist = 1.0f - (float)(k - pre_bin_high) / (float)(pre_trans_high);
-                    if (dist < 0.0f) dist = 0.0f;
-                    if (dist > 1.0f) dist = 1.0f;
-                    gain = dist;
-                } else {
-                    gain = 0.0f;
-                }
-            }
-            ctx->out1[k][0] *= gain; ctx->out1[k][1] *= gain;
-            ctx->out2[k][0] *= gain; ctx->out2[k][1] *= gain;
-        }
+        // 前置带通已移除：输出 HP @80Hz 压制低频，LSA 自然衰减高频
 
         // 相位旋转补偿亚采样延迟（复制 mic2 频谱用于旋转）
         fftwf_complex mic2_align[nbins];
         memcpy(mic2_align, ctx->out2, sizeof(fftwf_complex) * nbins);
         for (int k = 0; k < nbins; k++) {
             float omega_k = 2.0f * (float)3.14159265358979323846f * k / (float)input_len;
-            float phase = omega_k * delay;
+            float phase = -omega_k * delay;
             float c = cosf(phase), s = sinf(phase);
             float yr = mic2_align[k][0], yi = mic2_align[k][1];
             mic2_align[k][0] = yr * c + yi * s;
@@ -268,10 +224,17 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
         fftwf_complex y_fbf[nbins], y_u[nbins];
         tf_gsc_process_frame(tf_gsc, ctx->out1, mic2_align, y_fbf, y_u, ctx->cs, nbins);
 
-        // 信号恢复模块：根据余弦相似度选择麦克信号，补偿 FBF 对期望语音的损伤
-        //   Y_bar_FBF = Y_FBF + G_X · X_selected
-        //   最终输出叠加: Y_GSC + (Y_bar_FBF - Y_FBF) = Y_GSC + G_X · X_selected
-        if (restore) {
+        // 预扫描帧级平均 SNR（TF-GSC 原始输出，不受 restore/fusion 污染）
+        float frame_gamma_sum = 0.0f;
+        for (int k = 0; k < nbins; k++) {
+            float re_y = ctx->cs[k][0], im_y = ctx->cs[k][1];
+            frame_gamma_sum += (re_y*re_y + im_y*im_y) / (lsa.noise_pow[k] + 1e-10f);
+        }
+        float frame_gamma_avg = frame_gamma_sum / nbins;
+        int frame_silence = (frame_gamma_avg < 1.0f) ? 1 : 0;
+
+        // 信号恢复模块：静音帧跳过，避免恢复逻辑往 ctx->cs 注入噪声
+        if (!frame_silence && restore) {
             fftwf_complex y_restored[nbins];
             restore_process_frame(restore, y_fbf, y_u, ctx->out1, mic2_align, y_restored, nbins);
             for (int k = 0; k < nbins; k++) {
@@ -280,45 +243,14 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
             }
         }
 
-        // ── MSC 双麦相干后滤波（抑制全向扩散噪声） ──
-        //  MSC = |E{X1·X2*}|² / (E{|X1|²}·E{|X2|²})
-        //  MSC>0.8→G=1, MSC<0.5→G=0.25(-12dB), 线性渐变
-        for (int k = 0; k < nbins; k++) {
-            float re_x1 = ctx->out1[k][0], im_x1 = ctx->out1[k][1];
-            float re_x2 = mic2_align[k][0], im_x2 = mic2_align[k][1];
-            float p1 = re_x1*re_x1 + im_x1*im_x1;
-            float p2 = re_x2*re_x2 + im_x2*im_x2;
-            float cr = re_x1*re_x2 + im_x1*im_x2;   // Re(X1·X2*)
-            float ci = im_x1*re_x2 - re_x1*im_x2;   // Im(X1·X2*)
+        // 保存 LSA 的 SNR 基准（restore 后的 TF-GSC 干净输出）
+        fftwf_complex pre_fusion_spec[nbins];
+        memcpy(pre_fusion_spec, ctx->cs, sizeof(fftwf_complex) * nbins);
 
-            msc_S11[k] = msc_alpha * msc_S11[k] + (1.0f - msc_alpha) * p1;
-            msc_S22[k] = msc_alpha * msc_S22[k] + (1.0f - msc_alpha) * p2;
-            msc_S12_re[k] = msc_alpha * msc_S12_re[k] + (1.0f - msc_alpha) * cr;
-            msc_S12_im[k] = msc_alpha * msc_S12_im[k] + (1.0f - msc_alpha) * ci;
+        // (融合模块已移除：Test B 证明关融合后人声更高、底噪更低，fusion 重复建设无收益)
 
-            float S11 = msc_S11[k], S22 = msc_S22[k];
-            float S12_mag2 = msc_S12_re[k]*msc_S12_re[k] + msc_S12_im[k]*msc_S12_im[k];
-            float denom = S11 * S22 + 1e-10f;
-            float msc = S12_mag2 / denom;
-            if (msc > 1.0f) msc = 1.0f;
-
-            // MSC→增益映射：0.5以下衰减12dB，0.8以上保留
-            float g_msc;
-            if (msc < 0.5f)
-                g_msc = 0.25f;
-            else if (msc < 0.8f)
-                g_msc = 0.25f + (msc - 0.5f) / 0.3f * 0.75f;
-            else
-                g_msc = 1.0f;
-
-            // 二阶平滑，防止音乐噪声（0.5递归平滑）
-            msc_gain[k] = 0.5f * msc_gain[k] + 0.5f * g_msc;
-            ctx->cs[k][0] *= msc_gain[k];
-            ctx->cs[k][1] *= msc_gain[k];
-        }
-
-        // 后置 MMSE-LSA 降噪：消除 TF-GSC 无法处理的不相关底噪
-        lsa_process_frame(&lsa, ctx->cs);
+        // 后置 MMSE-LSA 降噪：SNR 用 pre_fusion_spec，噪声跟踪用 spec（净 TF-GSC）
+        lsa_process_frame(&lsa, ctx->cs, pre_fusion_spec);
 
         // IFFT
         fftwf_execute(ctx->plan_inv);
@@ -343,90 +275,33 @@ int16_t* freq_domain_beamform(GccPhatContext* ctx,
 
     /* ========== 输出时域滤波器链 ========== */
 
-    // 1. 六阶 Butterworth 高通 fc=80Hz（3 级级联双二阶），提升低频衰减斜率
-    //    原二阶 @80Hz 仅 12dB/oct，六阶达 36dB/oct，有效压制 50~80Hz 共振
-    //    系数由模拟极点经双线性变换预计算，fs=16kHz
-    //    第1级 (σ=0.2588)
-    float hp1_b0 =  0.9917f, hp1_b1 = -1.9834f, hp1_b2 =  0.9917f;
-    float hp1_a1 = -1.9829f, hp1_a2 =  0.9839f;
-    float hp1_x1=0, hp1_x2=0, hp1_y1=0, hp1_y2=0;
-    //    第2级 (σ=0.7071)
-    float hp2_b0 =  0.9780f, hp2_b1 = -1.9561f, hp2_b2 =  0.9780f;
-    float hp2_a1 = -1.9556f, hp2_a2 =  0.9566f;
-    float hp2_x1=0, hp2_x2=0, hp2_y1=0, hp2_y2=0;
-    //    第3级 (σ=0.9659)
-    float hp3_b0 =  0.9703f, hp3_b1 = -1.9406f, hp3_b2 =  0.9703f;
-    float hp3_a1 = -1.9401f, hp3_a2 =  0.9411f;
-    float hp3_x1=0, hp3_x2=0, hp3_y1=0, hp3_y2=0;
+    // 二阶 Butterworth 高通 fc=80Hz (fs=16kHz)
+    //  替代原六阶 HP（极点太靠近单位圆，数值噪声大）+ Q=15 陷波（振铃数百ms）
+    //  二阶 @80Hz 足以压制 DC/LF rumble，且无振铃问题
+    float hp_b0 =  0.9780304792f;
+    float hp_b1 = -1.9560609584f;
+    float hp_b2 =  0.9780304792f;
+    float hp_a1 = -1.9555782403f;
+    float hp_a2 =  0.9565436765f;
+    float hp_x1=0, hp_x2=0, hp_y1=0, hp_y2=0;
 
-    // 2. 自适应 50Hz 窄带陷波（Q=15），消除工频谐波
-    float notch_Q = 15.0f;
-    float w0_50 = 2.0f * (float)M_PI * 50.0f / (float)fs;
-    float alpha_50 = sinf(w0_50) / (2.0f * notch_Q);
-    float a0_50 = 1.0f + alpha_50;
-    float n50_b0 = 1.0f / a0_50;
-    float n50_b1 = -2.0f * cosf(w0_50) / a0_50;
-    float n50_b2 = 1.0f / a0_50;
-    float n50_a1 = n50_b1;    /* b1/a0 == -2cos(w0)/a0 */
-    float n50_a2 = (1.0f - alpha_50) / a0_50;
-    float n50_x1 = 0.0f, n50_x2 = 0.0f, n50_y1 = 0.0f, n50_y2 = 0.0f;
-
-    // 3. 自适应 100Hz 窄带陷波（Q=15），消除工频二次谐波
-    float w0_100 = 2.0f * (float)M_PI * 100.0f / (float)fs;
-    float alpha_100 = sinf(w0_100) / (2.0f * notch_Q);
-    float a0_100 = 1.0f + alpha_100;
-    float n100_b0 = 1.0f / a0_100;
-    float n100_b1 = -2.0f * cosf(w0_100) / a0_100;
-    float n100_b2 = 1.0f / a0_100;
-    float n100_a1 = n100_b1;
-    float n100_a2 = (1.0f - alpha_100) / a0_100;
-    float n100_x1 = 0.0f, n100_x2 = 0.0f, n100_y1 = 0.0f, n100_y2 = 0.0f;
-
-    // 4. (removed: 高频搁架移至频域 LSA 子带门控实现)
     for (uint32_t i = 0; i < total_out; i++) {
         float norm = (out_norm[i] > 1e-6f) ? out_norm[i] : 1.0f;
         float val = out_float[i] / ((float)input_len * norm);
 
-        // ① 六阶高通 80Hz（3 级级联），压制 50~80Hz 共振
-        float out_hp1 = hp1_b0*val + hp1_b1*hp1_x1 + hp1_b2*hp1_x2
-                       - hp1_a1*hp1_y1 - hp1_a2*hp1_y2;
-        hp1_x2 = hp1_x1; hp1_x1 = val;
-        hp1_y2 = hp1_y1; hp1_y1 = out_hp1;
+        // BPMLM-J@-LM-HP-?
+        float out_hp = hp_b0*val + hp_b1*hp_x1 + hp_b2*hp_x2
+                     - hp_a1*hp_y1 - hp_a2*hp_y2;
+        hp_x2 = hp_x1; hp_x1 = val;
+        hp_y2 = hp_y1; hp_y1 = out_hp;
+        val = out_hp;
 
-        float out_hp2 = hp2_b0*out_hp1 + hp2_b1*hp2_x1 + hp2_b2*hp2_x2
-                       - hp2_a1*hp2_y1 - hp2_a2*hp2_y2;
-        hp2_x2 = hp2_x1; hp2_x1 = out_hp1;
-        hp2_y2 = hp2_y1; hp2_y1 = out_hp2;
-
-        float out_hp3 = hp3_b0*out_hp2 + hp3_b1*hp3_x1 + hp3_b2*hp3_x2
-                       - hp3_a1*hp3_y1 - hp3_a2*hp3_y2;
-        hp3_x2 = hp3_x1; hp3_x1 = out_hp2;
-        hp3_y2 = hp3_y1; hp3_y1 = out_hp3;
-        val = out_hp3;
-
-        // ② 50Hz 窄带陷波 —— 消除工频基波
-        float out_n50 = n50_b0*val + n50_b1*n50_x1 + n50_b2*n50_x2
-                      - n50_a1*n50_y1 - n50_a2*n50_y2;
-        n50_x2 = n50_x1; n50_x1 = val;
-        n50_y2 = n50_y1; n50_y1 = out_n50;
-        val = out_n50;
-
-        // ③ 100Hz 窄带陷波 —— 消除工频二次谐波
-        float out_n100 = n100_b0*val + n100_b1*n100_x1 + n100_b2*n100_x2
-                       - n100_a1*n100_y1 - n100_a2*n100_y2;
-        n100_x2 = n100_x1; n100_x1 = val;
-        n100_y2 = n100_y1; n100_y1 = out_n100;
-        val = out_n100;
-
-        // 幅度恢复 + 软限幅
-        val *= 1.25f;
+        // LM-HM-TM-GM-!M-^KM-!M-
+        val *= 0.88f;
         if (val >  30000.0f) val =  30000.0f;
         if (val < -30000.0f) val = -30000.0f;
-        out[i] = (int16_t)val;
+        out[i] = (int16_t)(val + (val >= 0 ? 0.5f : -0.5f));
     }
-
-    free(msc_S11); free(msc_S22); free(msc_S12_re); free(msc_S12_im); free(msc_gain);
-
     free(out_float);
     free(out_norm);
     *outLen = total_out;

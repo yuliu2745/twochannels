@@ -23,6 +23,8 @@ typedef struct {
     float beta_low;         /* 低SNR帧 G_X 分母权重 (推荐 10.0) */
     float beta_high;        /* 高SNR帧 G_X 分母权重 (推荐 5.0~6.0) */
     float snr_thresh_db;    /* SNR 门限 (dB)，高于此使用 beta_high (推荐 15.0) */
+    int   sample_rate;      /* 音频采样率 (Hz)，用于计算 bin_hz */
+    float bin_hz;           /* 每个频点的频率宽度 (Hz/bin) */
 
     /* 帧级平滑余弦相似度 (状态) */
     float S_X1_Y_FBF;
@@ -47,7 +49,8 @@ typedef struct {
  * @return  SignalRestoreContext*  失败返回 NULL
  */
 SignalRestoreContext* restore_init(int complex_len, float lambda, float eta, float eta_low,
-                                   float beta_low, float beta_high, float snr_thresh_db);
+                                   float beta_low, float beta_high, float snr_thresh_db,
+                                   int sample_rate);
 
 /**
  * @brief 对一帧频域数据执行信号恢复
